@@ -46,17 +46,44 @@ fn patch_param_json(buf: &mut Vec<u8>) -> bool {
 /// A file named param.json gets patch_param_json (only these staged copies, never the game's).
 fn copy_file(title_id: &str, src: &Path, dst: &Path) -> io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
+    let t = std::time::Instant::now();
+    let bytes;
     if src.file_name().is_some_and(|n| n == "param.json") {
         let mut buf = fs::read(src)?;
         let patched = patch_param_json(&mut buf);
         fs::write(dst, &buf)?;
+        bytes = buf.len() as u64;
         if patched {
             log!("{title_id}: param.json patched: {}", dst.display());
         }
     } else {
-        fs::copy(src, dst)?;
+        bytes = copy_bytes(src, dst)?;
     }
-    fs::set_permissions(dst, fs::Permissions::from_mode(0o666))
+    let copy_ms = t.elapsed().as_millis();
+    let t = std::time::Instant::now();
+    let r = fs::set_permissions(dst, fs::Permissions::from_mode(0o666));
+    log!("{title_id}: copied {} ({} KiB): {copy_ms} ms, chmod {} ms", dst.display(), bytes / 1024, t.elapsed().as_millis());
+    r
+}
+
+/// Diagnostic: fs::copy with 1 MiB reads and writes instead of std's 8 KiB loop.
+fn copy_bytes(src: &Path, dst: &Path) -> io::Result<u64> {
+    use std::io::{Read, Write};
+    let mut r = fs::File::open(src)?;
+    let mut w = fs::File::create(dst)?;
+    let mut buf = vec![0u8; 1 << 20];
+    let mut total = 0u64;
+    loop {
+        let n = match r.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        };
+        w.write_all(&buf[..n])?;
+        total += n as u64;
+    }
+    Ok(total)
 }
 
 /// Recursive copy, like SMP copy_dir: existing files are overwritten.
