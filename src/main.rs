@@ -173,7 +173,7 @@ fn process(
             state.update(&src.path, |g| g.status = "checking");
             staged.push(src.clone());
         }
-        r => finish(state, s, src, registered, failed, r.map(|reg| reg == Reg::New)),
+        r => finish(state, s, src, registered, failed, r.map(|reg| reg == Reg::New), true),
     }
 }
 
@@ -188,16 +188,23 @@ fn install_staged(
     }
     let tids: Vec<String> = staged.iter().map(|g| g.title_id.clone()).collect();
     let r = register::install_all(&tids);
+    let one = tids.len() == 1;
     for src in staged.drain(..) {
         let r = r.as_ref().map(|_| true).map_err(|e| std::io::Error::new(e.kind(), e.to_string()));
-        finish(state, s, &src, registered, failed, r);
+        finish(state, s, &src, registered, failed, r, one);
+    }
+    // One toast for a batch: the console shows queued toasts one by one and the PS button opens
+    // the one on screen, so a toast per game (32 at once on a rebuild of all) blocked leaving a game.
+    if !one {
+        let l = i18n::lang();
+        toast(s, &if r.is_ok() { i18n::registered_many(l, tids.len()) } else { i18n::failed_many(l, tids.len()) });
     }
 }
 
-/// Status, toast and failure record of a processed title. Ok(true): registered now.
+/// Status, toast (`notify`) and failure record of a processed title. Ok(true): registered now.
 fn finish(
     state: &State, s: &Settings, src: &Source, registered: &mut HashSet<String>, failed: &mut HashMap<PathBuf, String>,
-    r: std::io::Result<bool>,
+    r: std::io::Result<bool>, notify: bool,
 ) {
     let tid = &src.title_id;
     let (size, built) = (cache::size(tid), cache::built_at(tid));
@@ -209,7 +216,7 @@ fn finish(
             state.update(&src.path, |g| {
                 (g.status, g.error, g.cache_size, g.cache_built) = ("ready", None, size, built);
             });
-            if new {
+            if new && notify {
                 toast(s, &i18n::registered(i18n::lang(), &src.title_name));
             }
         }
@@ -220,7 +227,9 @@ fn finish(
             state.update(&src.path, |g| {
                 (g.status, g.error, g.cache_size, g.cache_built) = ("error", Some(e.clone()), size, built);
             });
-            toast(s, &i18n::failed(i18n::lang(), &src.title_name));
+            if notify {
+                toast(s, &i18n::failed(i18n::lang(), &src.title_name));
+            }
         }
     }
 }

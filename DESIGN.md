@@ -227,7 +227,8 @@ for a Folder with a backport a unionfs of the backport dir on top (SMP
 (FW 12+) the title is only staged: InstallAll registers every folder under `/user/app`, so the scan
 pass calls it once after its last game for every title staged in it (SMP install queue), also
 when the pass stopped for a game start. Logged `<TIDs>: <dlsym error>; sceAppInstUtilAppInstallAll:
-<rc> (<ms> ms)`; a failure marks each of those titles failed.
+<rc> (<ms> ms)`; a failure marks each of those titles failed. A batch of more than one title
+gets one toast (`<n> games registered` / `<n> games failed`) instead of one per title.
 Every staged copy (sce_sys, `icon0.png`, appmeta, trophy files) is set to 0666 after writing: a
 copy keeps the source's mode, and a 0600 file from a game folder would stay unreadable for the
 trophy and save services. A copied file named `param.json` gets SMP `copy_param_json_rewrite`: the
