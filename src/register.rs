@@ -310,10 +310,12 @@ fn dlerror_str() -> String {
 
 fn resolve_symbol(nid: &[u8], name: &[u8], label: &str) -> Result<*mut c_void, String> {
     APP_INST_INIT.get_or_init(|| {
+        let t = std::time::Instant::now();
         let rc = unsafe { sceUserServiceInitialize(ptr::null()) };
-        log!("sceUserServiceInitialize: {:#x}", rc as u32);
+        log!("sceUserServiceInitialize: {:#x} ({} ms)", rc as u32, t.elapsed().as_millis());
+        let t = std::time::Instant::now();
         let rc = unsafe { sceAppInstUtilInitialize() };
-        log!("sceAppInstUtilInitialize: {:#x}", rc as u32);
+        log!("sceAppInstUtilInitialize: {:#x} ({} ms)", rc as u32, t.elapsed().as_millis());
     });
     let lib = CString::new(APP_INST_UTIL).expect("no NUL");
     let h = unsafe { libc::dlopen(lib.as_ptr(), libc::RTLD_LAZY) };
@@ -392,8 +394,9 @@ fn install_title_dir(title_id: &str) -> io::Result<()> {
             extern "C" {
                 fn sceAppInstUtilAppInstallAll(reserved: *mut c_void) -> i32;
             }
+            let t = std::time::Instant::now();
             let rc = unsafe { sceAppInstUtilAppInstallAll(ptr::null_mut()) } as u32;
-            log!("{title_id}: {e}; sceAppInstUtilAppInstallAll: {rc:#x}");
+            log!("{title_id}: {e}; sceAppInstUtilAppInstallAll: {rc:#x} ({} ms)", t.elapsed().as_millis());
             return if rc == 0 { Ok(()) } else { Err(err(format!("sceAppInstUtilAppInstallAll: {rc:#x}"))) };
         }
     };
@@ -414,6 +417,13 @@ pub fn register(title_id: &str, app0: &Path, sce_sys: &Path, backport: Option<&P
 }
 
 fn register_inner(title_id: &str, app0: &Path, sce_sys: &Path, backport: Option<&Path>) -> io::Result<()> {
+    // Diagnostic: how long each step takes (ms).
+    let lap = |t: &mut std::time::Instant| {
+        let ms = t.elapsed().as_millis();
+        *t = std::time::Instant::now();
+        ms
+    };
+    let mut t = std::time::Instant::now();
     let app_dir = Path::new(APP_BASE).join(title_id);
     let user_sce_sys = app_dir.join("sce_sys");
     ctx(copy_dir(title_id, sce_sys, &user_sce_sys), || {
@@ -423,11 +433,17 @@ fn register_inner(title_id: &str, app0: &Path, sce_sys: &Path, backport: Option<
     ctx(copy_file(title_id, &icon_src, &icon_dst), || {
         format!("copy {} -> {}", icon_src.display(), icon_dst.display())
     })?;
+    let copy_ms = lap(&mut t);
     let appmeta = Path::new(APPMETA_BASE).join(title_id);
     ctx(copy_appmeta(title_id, sce_sys, &appmeta), || format!("appmeta -> {}", appmeta.display()))?;
+    let appmeta_ms = lap(&mut t);
     ctx(update_trophy_metadata(title_id, sce_sys), || "trophy metadata".into())?;
+    let trophy_ms = lap(&mut t);
     mount_inner(title_id, app0, backport, false)?;
+    let mount_ms = lap(&mut t);
     install_title_dir(title_id)?;
+    let install_ms = lap(&mut t);
+    log!("{title_id}: register steps (ms): sce_sys {copy_ms}, appmeta {appmeta_ms}, trophy {trophy_ms}, mount {mount_ms}, install {install_ms}");
     // ponytail: SMP's fixed 200 ms (sm_install.c) for the install's app.db row to land; a row
     // not there yet is caught by the next run's already-registered pass or the next game exit.
     spawn_snd0info(title_id, 200);
