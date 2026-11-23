@@ -7,6 +7,7 @@
 
 #[macro_use]
 mod sys;
+mod maskdiag;
 mod i18n;
 mod ampr_index;
 mod cache;
@@ -763,6 +764,7 @@ fn main() {
         toast(&s, &i18n::port_busy(i18n::lang(), web::PORT));
         return;
     };
+    maskdiag::cleanup_leftover();
     toast(&s, i18n::started(i18n::lang()));
     install_bundled_ampr();
     prepare_ampr();

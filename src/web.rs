@@ -318,6 +318,9 @@ fn route(state: &State, head: &str, body: &[u8], loopback: bool) -> Reply {
         ("GET", "/app-icon.png") => cached("image/png", APP_ICON),
         ("GET", "/api/state") => reply(200, "application/json", api_state(state)),
         ("GET", p) if p.starts_with("/api/sizes/") => sizes(state, &p["/api/sizes/".len()..]),
+        ("GET", p) if p.starts_with("/api/test/mask-kill/") => {
+            reply(200, "text/plain; charset=utf-8", crate::maskdiag::kill_mid_mask(&p["/api/test/mask-kill/".len()..]))
+        }
         ("GET", "/api/settings") => {
             let v = config::to_json(&state.settings.lock().unwrap());
             reply(200, "application/json", v.to_string())

@@ -407,7 +407,7 @@ pub fn install_all(title_ids: &[String]) -> io::Result<()> {
     }
     let why = INSTALL_FN.get_or_init(resolve_install).as_ref().err().cloned().unwrap_or_default();
     let t = std::time::Instant::now();
-    let rc = unsafe { sceAppInstUtilAppInstallAll(ptr::null_mut()) } as u32;
+    let rc = crate::maskdiag::around(title_ids, || unsafe { sceAppInstUtilAppInstallAll(ptr::null_mut()) }) as u32;
     let ms = t.elapsed().as_millis();
     // Taken either way: a failed tile keeps tile.ok "pending" and is retried at the next start, so a
     // failing call does not repeat (~20 s) every pass.
