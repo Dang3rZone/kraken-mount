@@ -12,6 +12,8 @@ use std::io;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+/// The console's system fonts, mounted read-only into each sandbox we overlay.
+const FONTS: &str = "/preinst/common/font";
 const SANDBOX_ROOT: &str = "/mnt/sandbox";
 /// Fast path: how long to wait for ShellCore's common/lib mount after the sandbox dir appears.
 const READY_WAIT_MS: u64 = 3000;
@@ -348,6 +350,11 @@ impl Session {
         for from in std::iter::once("/data".to_string()).chain(crate::storage::mounted_aliases()) {
             self.mount_dir(&format!("{}{from}", root.display()), &from, 0);
         }
+        // The console's fonts, read-only (SMP mount_sandbox_fonts): homebrew draws CJK, Arabic or Thai
+        // text with them, and the sandbox has no /preinst. None on a firmware without the folder.
+        if std::path::Path::new(FONTS).is_dir() {
+            self.mount_dir(&format!("{}{FONTS}", root.display()), FONTS, libc::MNT_RDONLY as i32);
+        }
         // Writable /app0 (the game's files: the dump folder, or the pkg cache), then the pkg's folder
         // at /app0/kraken (ng finds the .pkg there). Both on top of the system's /app0.
         let app0 = format!("{}/app0", root.display());
@@ -649,7 +656,11 @@ impl Watcher {
                     s.data.push((path.clone(), m.fsid));
                 }
             }
-            // /app0/kraken too: left behind on exit it hangs the sandbox teardown like /data.
+            // The fonts and /app0/kraken too: left behind on exit they hang the sandbox teardown like /data.
+            let path = format!("{root}{FONTS}");
+            for m in all.iter().filter(|m| m.on == path && m.fstype == "nullfs" && m.from == FONTS) {
+                s.data.push((path.clone(), m.fsid));
+            }
             let pkg_dir = crate::cache::pkg_source(&tid)
                 .and_then(|p| std::path::Path::new(&p).parent().and_then(|d| d.to_str()).map(str::to_string));
             if let Some(from) = pkg_dir {
