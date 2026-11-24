@@ -3,8 +3,9 @@
 //! mounts the pkg's folder there), the two AMPR indexes; `.done` (JSON stamp, mtime = build start) last.
 //! fakelib/ (both kinds) = the game's or backport's libs, then /data/krakenmount/ampr/* copied on
 //! top (inject_ampr; always for a pkg); in between, the bundled DLC (dlc_emu) and PlayGo (pgo_stub)
-//! emulators when the game needs one and ships none (add_emulators; no pgo_stub for playgo_off). A change of the ampr files,
-//! inject_ampr or the emulator inputs only recomposes fakelib/ (refresh_fakelib), no full rebuild.
+//! emulators when the game needs one and ships none (add_emulators; no pgo_stub for playgo_off). For a title in
+//! overlay_off fakelib/ stays empty (no overlay at launch). A change of the ampr files,
+//! inject_ampr, overlay_off or the emulator inputs only recomposes fakelib/ (refresh_fakelib), no full rebuild.
 //! /app0 is writable: files the game writes here stay across rebuilds (`.built` lists what a build
 //! made, a rebuild removes only that); purge() deletes them too.
 //! /data/krakenmount/ampr is never copied here: launch.rs mounts it as its own layer.
@@ -693,9 +694,21 @@ pub fn playgo_import(tid: &str) -> Option<bool> {
     serde_json::from_slice::<serde_json::Value>(&b).ok()?["playgo"][2].as_bool()
 }
 
-/// The AMPR_STATE contents for `src` now.
+/// Whether this title gets an empty fakelib/, so no overlay at launch (the overlay_off setting).
+/// Folder games only: a pkg needs ampr-emu-ng's pkg mode, so a pkg source of a title turned off as
+/// a folder keeps its fakelib.
+fn overlay_off(src: &Source, s: &Settings) -> bool {
+    !matches!(src.kind, Kind::Pkg) && s.overlay_off.iter().any(|t| *t == src.title_id)
+}
+
+/// The AMPR_STATE contents for `src` now. "overlay_off" only when set, so a cache written before
+/// the setting existed stays fresh.
 fn fakelib_state(src: &Source, s: &Settings) -> serde_json::Value {
-    serde_json::json!({"ampr": ampr_state(src, s), "emus": emu_state(src, s)})
+    let mut state = serde_json::json!({"ampr": ampr_state(src, s), "emus": emu_state(src, s)});
+    if overlay_off(src, s) {
+        state["overlay_off"] = true.into();
+    }
+    state
 }
 
 /// Whether `r` contains `needle` (non-empty), read in `chunk`-sized pieces that overlap by
@@ -808,10 +821,10 @@ pub fn check(src: &Source, s: &Settings) -> Fresh {
         .unwrap_or_default();
     // An older `.ampr` (ampr files only, no "emus") differs too: every cache refreshes once, which
     // also drops a libSceSaveData.native.sprx that an older build copied (keep_game_lib).
-    // Only "ampr" and "emus" count: the "playgo" memo never triggers a refresh.
+    // Only "ampr", "emus" and "overlay_off" count: the "playgo" memo never triggers a refresh.
     let new = fakelib_state(src, s);
-    if ["ampr", "emus"].iter().any(|&k| had.get(k) != new.get(k)) {
-        return Fresh::Fakelib(format!("{AMPR_DIR}, inject_ampr, the bundled emulators or playgo_off changed"));
+    if ["ampr", "emus", "overlay_off"].iter().any(|&k| had.get(k) != new.get(k)) {
+        return Fresh::Fakelib(format!("{AMPR_DIR}, inject_ampr, the bundled emulators, playgo_off or overlay_off changed"));
     }
     Fresh::Fresh
 }
@@ -913,6 +926,17 @@ fn compose_fakelib(src: &Source, s: &Settings, pkg: Option<(&Io, &Pkg)>) -> Resu
         _ => {}
     }
     fs::create_dir_all(&fakelib)?;
+    if overlay_off(src, s) {
+        // Empty fakelib/: launch.rs then mounts no overlay. The playgo memo is kept (keyed by the eboot).
+        log!("{}: fakelib: overlay off (overlay_off)", src.title_id);
+        let mut state = fakelib_state(src, s);
+        if let Some(memo) = fs::read(dir.join(AMPR_STATE)).ok()
+            .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+            .and_then(|v| v.get("playgo").cloned()) {
+            state["playgo"] = memo;
+        }
+        return fs::write(dir.join(AMPR_STATE), state.to_string());
+    }
     if let Some(bp) = bp_lib(src) {
         copy_flat(&bp, &fakelib, keep_fakelib)?;
     } else if let Some((io, p)) = pkg {

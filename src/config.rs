@@ -7,10 +7,14 @@ pub const CONFIG_PATH: &str = "/data/krakenmount/config.toml";
 #[derive(Clone, PartialEq, Debug)]
 pub struct Settings {
     pub scan_paths: Vec<String>,
+    /// Absolute paths whose sources (the path itself or anything under it) the scan skips.
+    pub exclude: Vec<String>,
     pub inject_ampr: bool,
     pub add_emulators: bool,
     /// Title ids that get no bundled PlayGo stub (pgo_stub): not added, not upgraded.
     pub playgo_off: Vec<String>,
+    /// Title ids that get an empty fakelib/ (no overlay at launch: no game fakelib, ampr-emu-ng or emulators).
+    pub overlay_off: Vec<String>,
     pub ampr_auto_update: bool,
     pub backports: bool,
     pub scan_interval_secs: u64,
@@ -30,9 +34,11 @@ impl Default for Settings {
     fn default() -> Self {
         Settings {
             scan_paths: Vec::new(),
+            exclude: Vec::new(),
             inject_ampr: true,
             add_emulators: true,
             playgo_off: Vec::new(),
+            overlay_off: Vec::new(),
             ampr_auto_update: true,
             backports: true,
             scan_interval_secs: 10,
@@ -50,9 +56,11 @@ impl Default for Settings {
 
 const HELP: &[(&str, &str)] = &[
     ("scanpath", "replaces the default scan roots (/data/homebrew, /data/etaHEN/games, <drive>/homebrew, ...)"),
+    ("exclude", "absolute paths the scan skips: a source at one of them or under it is not listed or registered (a registered title stays registered)"),
     ("inject_ampr", "true = copy /data/krakenmount/ampr/* on top of a folder game's fakelib (pkg games always get it; a change only refreshes fakelib/)"),
     ("add_emulators", "true = add the bundled DLC (dlc_emu) and PlayGo (pgo_stub) emulators to a game's fakelib when it needs them and ships none (a change only refreshes fakelib/)"),
     ("playgo_off", "title ids that get no bundled PlayGo stub (pgo_stub): not added, not upgraded; a libScePlayGo.sprx the game ships stays (a change only refreshes fakelib/)"),
+    ("overlay_off", "title ids (folder games) that get no fakelib overlay at launch: not the game's fakelib/, not ampr-emu-ng, not the emulators (a change only refreshes fakelib/)"),
     ("ampr_auto_update", "true = once per start, download a newer ampr-emu-ng release from GitHub (a hand-placed libSceAmpr.sprx is kept)"),
     ("backports", "true = apply backports/<TID>* from the game's scan root, then the other roots, then /data/homebrew"),
     ("scan_interval_seconds", "scan loop period, 1..3600"),
@@ -89,6 +97,14 @@ fn set(s: &mut Settings, key: &str, v: &str) -> Result<(), String> {
             }
         }
         "scanpath" => return Err(format!("expected an absolute path, got {v:?}")),
+        "exclude" if v.starts_with('/') && !v.chars().any(char::is_control) => {
+            let v = v.trim_end_matches('/');
+            let v = if v.is_empty() { "/" } else { v };
+            if !s.exclude.iter().any(|p| p == v) {
+                s.exclude.push(v.to_string());
+            }
+        }
+        "exclude" => return Err(format!("expected an absolute path without control characters, got {v:?}")),
         "inject_ampr" => s.inject_ampr = flag(v)?,
         "add_emulators" => s.add_emulators = flag(v)?,
         "playgo_off" if crate::scan::valid_tid(v) => {
@@ -97,6 +113,12 @@ fn set(s: &mut Settings, key: &str, v: &str) -> Result<(), String> {
             }
         }
         "playgo_off" => return Err(format!("expected a title id like PPSA01556, got {v:?}")),
+        "overlay_off" if crate::scan::valid_tid(v) => {
+            if !s.overlay_off.iter().any(|t| t == v) {
+                s.overlay_off.push(v.to_string());
+            }
+        }
+        "overlay_off" => return Err(format!("expected a title id like PPSA01556, got {v:?}")),
         "ampr_auto_update" => s.ampr_auto_update = flag(v)?,
         // Removed setting (the game's fakelib is always used in full): ignored, dropped on the next save.
         "game_fakelib" => {}
@@ -243,6 +265,10 @@ fn parse(text: &str) -> Settings {
                 s.scan_paths.clear(); // the array replaces the defaults (and an earlier scanpath line)
             } else if k == "playgo_off" {
                 s.playgo_off.clear(); // a later playgo_off line replaces an earlier one
+            } else if k == "overlay_off" {
+                s.overlay_off.clear();
+            } else if k == "exclude" {
+                s.exclude.clear();
             } else if vals.len() != 1 {
                 return Err("expected one value, not an array".into());
             } else {
@@ -275,11 +301,19 @@ fn render(s: &Settings) -> String {
                 let items: Vec<String> = s.scan_paths.iter().map(|p| toml_quote(p)).collect();
                 out += &format!("scanpath = [{}]\n", items.join(", "));
             }
+            "exclude" => {
+                let items: Vec<String> = s.exclude.iter().map(|p| toml_quote(p)).collect();
+                out += &format!("exclude = [{}]\n", items.join(", "));
+            }
             "inject_ampr" => out += &format!("{k} = {}\n", s.inject_ampr),
             "add_emulators" => out += &format!("{k} = {}\n", s.add_emulators),
             "playgo_off" => {
                 let items: Vec<String> = s.playgo_off.iter().map(|t| toml_quote(t)).collect();
                 out += &format!("playgo_off = [{}]\n", items.join(", "));
+            }
+            "overlay_off" => {
+                let items: Vec<String> = s.overlay_off.iter().map(|t| toml_quote(t)).collect();
+                out += &format!("overlay_off = [{}]\n", items.join(", "));
             }
             "ampr_auto_update" => out += &format!("{k} = {}\n", s.ampr_auto_update),
             "backports" => out += &format!("{k} = {}\n", s.backports),
@@ -328,9 +362,11 @@ pub fn save(s: &Settings) -> std::io::Result<()> {
 pub fn to_json(s: &Settings) -> Value {
     json!({
         "scanpath": s.scan_paths,
+        "exclude": s.exclude,
         "inject_ampr": s.inject_ampr,
         "add_emulators": s.add_emulators,
         "playgo_off": s.playgo_off,
+        "overlay_off": s.overlay_off,
         "ampr_auto_update": s.ampr_auto_update,
         "backports": s.backports,
         "scan_interval_seconds": s.scan_interval_secs,
@@ -350,8 +386,8 @@ pub fn from_json(v: &Value) -> Result<Settings, String> {
     let mut s = Settings::default();
     for (k, val) in obj {
         let vals: Vec<&Value> = match (k.as_str(), val) {
-            ("scanpath" | "playgo_off", Value::Array(a)) => a.iter().collect(),
-            ("scanpath" | "playgo_off", _) => return Err(format!("{k}: expected an array of strings")),
+            ("scanpath" | "exclude" | "playgo_off" | "overlay_off", Value::Array(a)) => a.iter().collect(),
+            ("scanpath" | "exclude" | "playgo_off" | "overlay_off", _) => return Err(format!("{k}: expected an array of strings")),
             _ => vec![val],
         };
         for x in vals {

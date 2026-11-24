@@ -59,9 +59,11 @@ A flat TOML subset: `key = value` with strings, `true`/`false`, integers and arr
 | Key | Default | Meaning |
 |---|---|---|
 | `scanpath` | (defaults above) | array of paths; replaces the default scan roots |
+| `exclude` | [] | array of absolute paths (trailing `/` trimmed, duplicates dropped); a source at an entry or under it (whole path components, `scan::excluded`) is skipped by the scan before duplicate detection, never listed or descended into (an excluded root is not opened): not in games, duplicates, errors or unstable, never built or registered. An excluded title that is still registered stays registered (as SMP removing a manual source). Edited by `/api/v1/manual/{add,remove}` and `/api/v1/games/uninstall` |
 | `inject_ampr` | true | copy `/data/krakenmount/ampr/*` on top of a folder game's fakelib; pkg games always get it (pkg mode exists only in ampr-emu-ng) (a change only refreshes `fakelib/`) |
 | `add_emulators` | true | add the bundled DLC (dlc_emu) and PlayGo (pgo_stub) emulators to a game's fakelib when it needs them and ships none (a change only refreshes `fakelib/`) |
 | `playgo_off` | [] | array of title ids (`playgo_off = ["PPSA01556"]`) that get no bundled PlayGo stub: pgo_stub is neither added nor upgraded, a `libScePlayGo.sprx` the game or backport ships stays as shipped; the dlc_emu set is unaffected. Per game from the UI (`POST /api/playgo/<TID>`); a change only refreshes `fakelib/` |
+| `overlay_off` | [] | array of title ids whose cache gets an empty `fakelib/`, so launch mounts no overlay: not the game's or backport's fakelib, not ampr-emu-ng, not the emulators; like any empty `fakelib/`, the launch watcher then mounts nothing in its sandbox (no `/data`, USB or writable `/app0` either): the title runs as registered. Folder games only: a pkg needs ampr-emu-ng's pkg mode, so the web refuses it for a pkg (409) and a pkg source of a listed title keeps its fakelib. Per game from `POST /api/overlay/<TID>` or `/api/v1/games/fakelib`; a change only refreshes `fakelib/` |
 | `ampr_auto_update` | true | once per start, download a newer ampr-emu-ng release from GitHub (a hand-placed `libSceAmpr.sprx` is kept) |
 | `backports` | true | apply `<scan root>/backports/<TID>*` |
 | `scan_interval_seconds` | 10 | scan loop period (1..3600) |
@@ -73,7 +75,7 @@ A flat TOML subset: `key = value` with strings, `true`/`false`, integers and arr
 | `log` | true | write `/data/krakenmount/kraken.log` (stdout always gets the lines) |
 | `debug` | false | klog capture to `/data/krakenmount/klog.txt` and the `/file/data/...` route |
 
-Invalid values are logged and replaced by the default; a string item of an array (`scanpath`, `playgo_off`) that is not
+Invalid values are logged and replaced by the default; a string item of an array (`scanpath`, `exclude`, `playgo_off`, `overlay_off`) that is not
 a valid value is logged and skipped, the other items stay (an array that does not parse, such as one with a number in it,
 is ignored as a whole). The web UI edits the same file.
 
@@ -120,6 +122,9 @@ is ignored as a whole). The web UI edits the same file.
   is added or upgraded (no mixed set), logged `<TID>: fakelib: kept the game's dlc_emu files (not a known release)`; pgo_stub goes per file.
   A title in `playgo_off` skips pgo_stub entirely (no add, no upgrade, the eboot is not searched), logged
   `<TID>: fakelib: PlayGo stub off (playgo_off)`; `fakelib/` starts from scratch, so a stub added earlier is gone.
+  A folder title in `overlay_off` stops right after `fakelib/` is emptied (no base, no emulators, no ampr), logged
+  `<TID>: fakelib: overlay off (overlay_off)`; `.ampr` is written with `"overlay_off": true` and the earlier
+  "playgo" memo kept. Launch then mounts no overlay (empty `fakelib/`).
   Then, with `inject_ampr` and always for a pkg game (the package's own `libSceAmpr.sprx` cannot read the
   `.pkg` named in `kraken.image`), every file of `/data/krakenmount/ampr/` (not `libkernel.sprx`) is copied on top,
   so ours wins over the game's own `libSceAmpr.sprx`, except a game's or backport's ampr-emu-ng strictly newer than
@@ -131,7 +136,8 @@ is ignored as a whole). The web UI edits the same file.
   import search: `eboot.bin` is read again only when its (size, mtime) differs (a read error is not memoized), and
   `check` never compares it. An older `.ampr` without `emus` differs, so every cache refreshes `fakelib/` once; that
   one-time refresh also drops a `libSceSaveData.native.sprx` an older build copied (no separate check for such files).
-  When "ampr" or "emus" differ (the ampr dir, `inject_ampr` or the emulator inputs changed) or `.done` still has a
+  `"overlay_off": true` is in `.ampr` only for a title in `overlay_off` (an older `.ampr` stays fresh).
+  When "ampr", "emus" or "overlay_off" differ (the ampr dir, `inject_ampr`, the emulator inputs or `overlay_off` changed) or `.done` still has a
   `game_fakelib` other than `full` (a cache built before the setting was removed), `check` says `Fakelib` and only `fakelib/` is
   recomposed (`refresh_fakelib`, which then rewrites `.done` with its own mtime), no extraction or re-registration. `fakelib/` is not in the AMPR index.
 - A folder game's cache is only `fakelib/`, `.ampr`, `.built`, `.done`: nothing of the game is copied.
@@ -169,12 +175,13 @@ is ignored as a whole). The web UI edits the same file.
 
 ## Flow (`src/main.rs`)
 Start: `umask(0)` first, so every dir/file the payload creates is 0777/0666 (as SMP, which mkdirs
-0777) whatever elfldr passes; then create dirs, load config, take port 8097 (asks an older copy to quit), install the bundled
+0777) whatever elfldr passes; then create dirs, load config, take port 8097 (asks an older copy to quit every 250 ms for 5 s; it refuses while its scan pass runs), install the bundled
 `libSceAmpr.sprx` when `ampr/libSceAmpr.sprx` is missing or matches `ampr.bundled` (an older bundled
-copy; a file put there by hand is kept; see Auto-update below), ampr chmod, web thread, klog thread when `debug`, then wait
+copy; a file put there by hand is kept; see Auto-update below), ampr chmod, self copy thread, self-update check thread
+(`update::spawn_check`, see Self-update below), web thread, klog thread when `debug`, then wait
 (2 s poll, one toast per reason, `waiting` in `/api/state` for the UI banner) until kstuff answers its KEKCALL_CHECK probe (`sys::kstuff_loaded`,
 SMP `sm_kstuff_is_loaded`) and no `shadowmountplus.elf` process runs, then the launch watcher thread. Loop every `scan_interval_seconds` or on
-wake: reload config, scan, then for each game: freshness check, build if stale or forced,
+wake: reload config, scan (sources in `exclude` skipped, see Settings; a source excluded while the pass runs is skipped before its build/register), then for each game: freshness check, build if stale or forced,
 register (once per run, and after every rebuild), status `ready`. Right before the register (or the
 mount-only path below), once per run per title, `cache::fix_access` opens up the cache and the
 source for the game and the system services (it only adds missing bits); a relinked moved game
@@ -220,6 +227,11 @@ loop (fakelib refresh); one update runs at a time. Settings has "Update ampr-emu
 installed; a hand-placed file is first moved to `/data/krakenmount/libSceAmpr.sprx.hand` (one backup,
 outside `ampr/`). HTTPS goes through the console's sceHttp/sceSsl with 4 built-in root CAs
 (from SMP).
+Self-update (`src/update.rs`): always on, no setting, once per start, on its own thread: GET
+`https://api.github.com/repos/quer3q/kraken-mount/releases/latest` (`main::get_retry`, 3 tries 20 s apart, max 1 MiB;
+`main::parse_release` with asset `kraken-mount.elf`), logged `update: latest <tag> (running <v>)` or `update: <error>`
+(no such asset is an error). The release is kept for `/api/state` `update` and `POST /api/self_update` only when its
+`tag_name` is newer than `CARGO_PKG_VERSION` (`main::newer`) and the asset size is > 0.
 Running game: while `launch::watch` reports a live session (`running`), the loop does no
 scan/build/register/purge (a game starting mid-scan stops the scan before the next title);
 rescan/rebuild/purge requests stay queued and run after the game exits (2 s poll).
@@ -227,7 +239,7 @@ Toasts: `sceNotificationSend` system toast (dump-forge/SMP JSON, icon `/user/dat
 the old `sceKernelSendNotificationRequest` only as fallback. Toast texts (`src/i18n.rs`) follow the console language
 (`sceSystemServiceParamGetInt` lang, read per toast; dump-forge's 11: en ru zh de es fr ja pt it ko ar), English when it
 cannot be read; "Kraken Mount", title names and paths stay as they are. A failed game is retried
-only when its inputs change or a rebuild is forced. Duplicate title ids: a folder beats a pkg, then the first scan root wins;
+only when its inputs change (`inputs_key`: stamp, input mtimes, its `playgo_off` and `overlay_off` membership) or a rebuild is forced. Duplicate title ids: a folder beats a pkg, then the first scan root wins;
 the others show `duplicate`. Low `/data` space (checked before the games, before and after each
 build, after the scan): toast once per run and a UI banner.
 
@@ -283,7 +295,7 @@ cancels that and mounts the nullfs mounts again (~10 ms after the exec: the fork
 only at the exec, so they cannot go back earlier). When the exec fallback cannot mount the overlay, they are
 still mounted. A later copy of the payload adopts the overlay, `/data`, USB and `/app0/kraken` mounts.
 When a session's cleanup ends, `register::spawn_snd0info(<TID>, 0)` (own thread).
-No overlay when neither layer applies.
+No overlay when neither layer applies, and with an empty `fakelib/` (an `overlay_off` title) no sandbox mount at all.
 
 ## Crash report (`src/crash.rs`)
 When an app crashes, the console writes `/user/devlog/system/sce_coredumps.0/<TID>_<n>/` (also seen as
@@ -303,8 +315,8 @@ reboot. Not in the game's cache: for a pkg the cache is /app0, so the game would
 // config.rs
 pub const CONFIG_PATH: &str = "/data/krakenmount/config.toml";
 #[derive(Clone, PartialEq, Debug)]
-pub struct Settings { pub scan_paths: Vec<String>, pub inject_ampr: bool, pub add_emulators: bool,
-  pub playgo_off: Vec<String>, pub ampr_auto_update: bool,
+pub struct Settings { pub scan_paths: Vec<String>, pub exclude: Vec<String>, pub inject_ampr: bool, pub add_emulators: bool,
+  pub playgo_off: Vec<String>, pub overlay_off: Vec<String>, pub ampr_auto_update: bool,
   pub backports: bool, pub scan_interval_secs: u64, pub stability_wait_secs: u64, pub low_space_gb: u64,
   pub auto_remove_missing: bool, pub auto_remove_delay_secs: u64, pub notify: bool, pub log: bool, pub debug: bool }
 impl Default for Settings
@@ -331,7 +343,8 @@ pub struct Source { pub path: std::path::PathBuf, pub kind: Kind, pub title_id: 
   pub drive: String, pub size: u64 /* pkg file size; folder: 0 */, pub backport: Option<std::path::PathBuf> }
 pub struct ScanResult { pub games: Vec<Source>, pub duplicates: Vec<Source>, pub errors: Vec<(std::path::PathBuf, String)>,
   pub unstable: Vec<(std::path::PathBuf, Option<String> /* title id when known */)> } // still being copied: skipped, not gone
-pub fn scan(roots: &[String], backports: bool, stability_wait: u64) -> ScanResult;  // memoizes pkg param reads by (path, size, mtime)
+pub fn scan(roots: &[String], exclude: &[String], backports: bool, stability_wait: u64) -> ScanResult;  // memoizes pkg param reads by (path, size, mtime)
+pub fn excluded(path: &std::path::Path, exclude: &[String]) -> bool; // path is an exclude entry or under one (whole components)
 pub fn still_written(paths: &[std::path::PathBuf], wait: u64) -> Option<u64>; // age in s of the youngest max(mtime, ctime) under wait; None = stable
 pub fn parse_param(json: &[u8]) -> std::io::Result<(String, String, String)>; // (title_id, title_name, version); name: see below
 pub fn valid_tid(t: &str) -> bool;
@@ -362,6 +375,7 @@ pub fn register(title_id: &str, app0: &std::path::Path, sce_sys: &std::path::Pat
 pub fn register_tile(port: u16);
 pub fn tile_staged() -> bool;                             // FW 12+: the tile waits for the pass's install_all
 pub fn is_registered(title_id: &str) -> bool;
+pub fn registered(tids: &[&str]) -> Vec<bool>;            // is_registered for many, in tids order, one app.db read (all false when unreadable)
 pub fn set_snd0info(title_id: &str);                      // app.db snd0info -> /user/appmeta/<TID>/snd0.at9; logs, never fails
 pub fn spawn_snd0info(title_id: &str, delay_ms: u64);    // set_snd0info on its own thread after delay_ms
 pub fn mount(title_id: &str, app0: &std::path::Path, backport: Option<&std::path::Path>) -> std::io::Result<()>;
@@ -374,6 +388,17 @@ pub fn is_ours(title_id: &str) -> Result<(), std::path::PathBuf>; // Err(path) =
 // main.rs (shared version compare, used by cache.rs for ampr-emu-ng identities)
 pub(crate) fn parse_version(v: &str) -> Option<(u32, u32, u32)>; // "X.Y.Z", leading "v" allowed
 pub(crate) fn newer(a: Option<&str>, b: Option<&str>) -> bool;   // a strictly newer than b; an unknown version is older than any
+// main.rs (GitHub release helpers, shared by the ampr-emu-ng auto-update and update.rs)
+pub(crate) struct Release { pub(crate) tag: String, pub(crate) url: String, pub(crate) size: usize }
+pub(crate) fn parse_release(body: &[u8], asset: &str) -> Result<Release, String>; // tag_name + that asset of releases/latest
+pub(crate) fn get_retry(prefix: &str, url: &str, max: usize, attempts: u32) -> Result<Vec<u8>, String>; // 20 s apart, failures logged after prefix
+pub(crate) fn is_module(b: &[u8]) -> bool;                         // ELF or SELF magic
+
+// update.rs (self-update, see Flow "Self-update" and Web API /api/self_update)
+pub fn spawn_check();                                              // the start-up release check thread
+pub fn holding() -> bool;                                          // an install in flight or sent < 90 s ago: no scan pass
+pub fn available() -> Option<serde_json::Value>;                   // {version, size} of the newer release, None when none
+pub fn install(version: &str, paused: &dyn Fn() -> bool, pass_idle: &dyn Fn() -> bool) -> Result<(), (u16, String)>; // download + send to elfldr; paused asked before both; Err = (HTTP status, text)
 
 // launch.rs (titles: overlay these; running: title ids with a live session, kept by the watcher)
 pub fn watch(titles: Arc<Mutex<HashSet<String>>>, running: Arc<Mutex<HashSet<String>>>);
@@ -389,11 +414,14 @@ If a newer copy took the port meanwhile, this copy quits (not while a game runs)
   `GET /kraken.appcache` the AppCache manifest (version + page hash). These three are `no-cache`,
   the rest `no-store`.
 - `GET /api/state`:
-  `{version, busy, paused, waiting:"kstuff"|"shadowmount"|null, running:[TID], games:[{title_id, title_name, version, path, kind:"pkg"|"folder", packing:"plain"|"zstd"|"lz4"|null,
+  `{version, update:{version:"<tag>", size}|null (the installable newer release found at start, see Self-update), busy, paused, waiting:"kstuff"|"shadowmount"|null, running:[TID], games:[{title_id, title_name, version, path, kind:"pkg"|"folder", packing:"plain"|"zstd"|"lz4"|null,
   drive, size, status:"pending"|"checking"|"building"|"ready"|"error"|"duplicate", error, cache_size, cache_built, backport,
   playgo: bool|null (the memoized "eboot imports PlayGo", null when unknown or `add_emulators` is off), playgo_off: bool (false while `add_emulators` is off),
   crash: {at, process, status}|null (the last crash, from crashes.json, see Crash report),
-  rebuild_queued: bool (a rebuild asked for, not started yet; the UI keeps Rebuild disabled through it and while the game is pending, checking or building)}],
+  rebuild_queued: bool (a rebuild asked for, not started yet; the UI keeps Rebuild disabled through it and while the game is pending, checking or building),
+  registered: bool (`register::registered`: staged param.json files and the TID in app.db, one app.db read per request),
+  mounted: bool (`/system_ex/app/<TID>` is a mount point, one mount table per request), source_present: bool (the source path exists),
+  overlay_off: bool (listed in `overlay_off` and a folder source)}],
   drives:[{mount, label, kind, total, free, ejectable}], cache:{path, size, free, low_space, ampr_present}, log:[last 100 lines of the last 64 KiB]}`
 - `GET /api/report/<TID>` -> plain text for an issue: Kraken Mount version, a firmware line to fill in,
   the game (name, title id, version, source, kind, drive, status and error), ampr-emu-ng (`/api/ampr`
@@ -401,10 +429,24 @@ If a newer copy took the port meanwhile, this copy quits (not while a game runs)
   the log tail (64 KiB) that contain the title id; 404 for an invalid or absent library title.
   The game sheet's Report button opens it.
 - `GET /api/settings` -> settings JSON; `POST /api/settings` (JSON body) -> save, apply, rescan; a body
-  without `playgo_off` keeps the current list (the settings form does not send it).
+  without `playgo_off`, `overlay_off` or `exclude` keeps that current list from the file (the settings form
+  sends none of them); 409 when `overlay_off` names a pkg game of the library.
 - `POST /api/playgo/<TID>`, body exactly `on` or `off` -> removes the title from / adds it to `playgo_off`,
   saves, applies, rescans, logs `<TID>: PlayGo stub on|off`, 204; 404 for an invalid or absent library
   title, 400 for any other body.
+- `POST /api/overlay/<TID>`, body exactly `on` or `off` -> removes the title from / adds it to `overlay_off`,
+  as `/api/playgo` (shared `change_settings`), logs `<TID>: overlay on|off`, 204; 404 for an invalid or absent
+  library title, 400 for any other body (for a library title), 409 for `off` on a pkg game, 500 when the save fails.
+- `POST /api/self_update`, body `{"version":"<tag>"}` -> `update::install`: 200 `{}` once the ELF is downloaded
+  and sent to elfldr; 400 for a missing version or one that is not the newer release found at start; 409 while a scan pass holds `State::work` (checked once the hold below is set), while
+  a game runs (checked before the download and again before the send: the new copy's `take_port` would be refused) or another update runs or was sent less than 90 s ago; 503 when elfldr does not
+  answer on 127.0.0.1:9021 (1 s connect probe before the download, closed at once); 502 + text when the asset
+  is over 32 MiB, the download fails (one try), its length is not the asset size or it is not ELF/SELF
+  (`main::is_module`), or the send fails. Send: connect 127.0.0.1:9021, `write_all`, `shutdown(Write)`, drop.
+  The new copy then takes over the port (asks this copy to quit) and saves its own self copy.
+  While an install runs and for 90 s after its send the scan loop starts no pass (`update::holding`, checked after
+  taking `State::work`), so a new copy that never takes over only delays the scan. The UI shows Updating... until `/api/state` answers another `version` (then reloads), or an error after 2 min. Logged
+  `update: <tag> (<n> bytes) sent to elfldr` or `update: <tag> failed (<code>): <error>`.
 - `GET /api/ampr` -> `{kind: "bundled"|"downloaded"|"hand"|"missing"|"error", version, updating}` of
   `ampr/libSceAmpr.sprx`; `POST /api/ampr/update` -> forced update, answered when done: 200 + result text,
   409 while one runs, 502 + error text.
@@ -428,6 +470,34 @@ If a newer copy took the port meanwhile, this copy quits (not while a game runs)
   fails, the cache and tile stay and the next pass remounts the title (a folder partly removed stays so).
   Then it uninstalls the home-screen entry (failure logged), removes the title from the launch set
   and its game row, wakes the scan loop, deletes the cache, and logs and optionally notifies.
+- `POST /api/v1/<route>`: the subset of ShadowMount+'s API v1 (SMP `docs/api.md`) that Playden calls, on port 8097.
+  Body: one JSON object (empty or whitespace = `{}`; anything else 400). Answer: JSON, HTTP 200 with `status: 0`,
+  else `{status: <FreeBSD errno>, error}` with HTTP 400 (EINVAL), 404 (ENOENT; also an unknown route), 409
+  (EBUSY, EPERM, EINVAL), 500 (a config save error's errno) or 501 (ENOTSUP). Routes (SMP meaning -> Kraken Mount):
+  - `version` -> `{status, api_version: 1, kraken_mount_version, capabilities: ["list_games", "add_manual_source",
+    "remove_manual_source", "uninstall_game", "rescan", "fakelib"]}`.
+  - `games` -> `{status, count, games: [{title_id, name, version, path, runtime_path (folder: path; pkg: ""),
+    source_type: "folder"|"pkg", managed: true, installed (= registered), mounted, source_available (= source_present),
+    status (the Kraken status), error ("" when none), fakelib_mode: "full"|"disabled" (overlay_off, folder sources only)}]}`; library
+    titles only (no `duplicate` rows); the three flags as in `/api/state`.
+  - `manual/remove {path}` -> adds `path` to `exclude` (Kraken Mount sees every folder in its scan roots, so
+    removing a manual source means not seeing it); `manual/add {path}` -> takes it off `exclude`. `path` must be an
+    absolute string without control characters (400 EINVAL), stored as config.rs does (trailing `/` trimmed). Idempotent:
+    `{status, changed}`; a change saves the config, wakes the scan loop and logs `<path>: added to|removed from the
+    excluded paths from the web API`.
+  - `scan` -> wakes the scan loop, `{status}`.
+  - `games/uninstall {title_id}` -> off the home screen, keeping the source and the cache (game-written files stay):
+    the guards of `/api/delete` (`lock_title`: invalid or absent title 404 ENOENT; `State::work` held, a game running
+    or this title building 409 EBUSY), `register::is_ours` (an installed copy or no staged param.json 409 EPERM, as
+    auto-remove), `register::unmount_title` without force (failure 409 EBUSY), the source path and the paths of its
+    duplicates (else the next scan registers a duplicate) added to `exclude` and saved (not absolute 409 EINVAL; a save error 500, the next pass remounts), `register::uninstall`
+    (failure 500 EIO, the exclusions this call added taken back: the next pass remounts it), then `register::forget`, the title out of the launch set and its game rows
+    dropped, scan loop woken. Logged `<TID>: uninstalled from the web API, <path> kept and excluded`.
+    ponytail: a non-UTF-8 source path is excluded by its lossy text, which then matches nothing.
+  - `games/fakelib {title_id, mode}` (`disabled` = overlay off; `full` or `default` = on; `emulators` 501 ENOTSUP;
+    other 400 EINVAL) or `{title_id, ignore_global_fakelib: bool}` (true = off; `mode` wins when both) -> as
+    `/api/overlay` (`set_overlay`: absent title 404 ENOENT, off for a pkg 409 EPERM) ->
+    `{status, fakelib_mode, saved: true, applies_on_next_launch: true}`.
 - `POST /api/eject`, body: the drive's mount path (`/mnt/usb0`) -> 204 once the path is no longer a
   mount point; 400 when not ejectable, 404 when not mounted, 409 while the scan loop is in a pass
   (try-lock of `State::work`, held to the end so no pass builds, registers or remounts meanwhile),
@@ -442,7 +512,9 @@ If a newer copy took the port meanwhile, this copy quits (not while a game runs)
 - `GET /icon/<TID>` icon0.png, `GET /pic/<TID>` pic0.png (or pic1.png): from the source's sce_sys, fallback
   `/user/appmeta/<TID>/`, then (pkg) from the .pkg itself via `cache::pkg_file`; 404 when none. Keyed by title id; the UI must re-request when the title id appears.
 - `GET /file/data/...` only with `debug=1`. `POST /api/quit`: loopback with an empty body (a newer copy
-  taking over) or body `shutdown` from any host (the UI's Shut down, toast "Kraken Mount stopped"); 409 while a game runs.
+  taking over) or body `shutdown` from any host (the UI's Shut down, toast "Kraken Mount stopped"); 409 while a game runs, and (a newer copy only) while a scan pass holds `State::work`:
+  quitting mid-build would leave a cache without `.built`; once taken, the lock is held until exit. A copy loaded by
+  hand or by a payload manager during a build longer than `take_port`'s 5 s therefore exits with the port-busy toast.
 
 ## Self copy and start on open (as Dump Forge)
 `ps5/build.sh` builds twice: stage 1, then stage 2 (`--features self-copy`, env `KRAKEN_SELF_ELF`) embedding
@@ -450,8 +522,22 @@ stage 1. The pushed stage 2 saves stage 1 to `/data/krakenmount/kraken-mount.elf
 (temp + fsync + rename; the last pushed wins). The tile opens the AppCache'd page; on the console's own browser
 (127.0.0.1:8097) a failed `/api/state` makes it ask elfldr once per page load:
 `GET http://127.0.0.1:9021/data/krakenmount/kraken-mount.elf?args=serve&pipe=0&n=<nonce>`, then it keeps polling.
+Self-update (as Dump Forge): `POST /api/self_update` sends the newer release's `kraken-mount.elf` to elfldr
+(127.0.0.1:9021); that copy takes over port 8097 (`web::take_port` asks this one to quit) and, being a stage 2 build,
+saves its own stage 1 as the self copy, so the tile starts the new version. ps5-payload-manager updates it too:
+each release carries `payloads.json` (a custom repository, `https://github.com/quer3q/kraken-mount/releases/latest/download/payloads.json`).
 - Requests are capped at 16 KiB: head too large 431, head + Content-Length too large (or overflowing) 413,
   non-numeric Content-Length 400.
 
 ## Build and check
 `cargo check --target x86_64-unknown-freebsd` (fast, host). Full payload: `ps5/build.sh` (Docker).
+Release (`.github/workflows/build.yml`, on a `v*` tag): checkout, the tag must equal `v` + Cargo.toml's version,
+`sha256sum -c SHA256SUMS`, then `ps5/make-payloads-json.sh kraken-mount.elf payloads.json`, and a draft release with
+`kraken-mount.elf`, `SHA256SUMS` and `payloads.json` (not in SHA256SUMS).
+`ps5/make-payloads-json.sh <elf> [out.json]` (default `payloads.json`): the ps5-payload-manager catalog
+(schema: itsPLK/ps5-payload-manager `CUSTOM_REPOSITORIES.md`), top-level `name` "Kraken Mount" and one payload: id
+`kraken-mount`, name `Kraken Mount`, filename `kraken-mount.elf`, url
+`https://github.com/$GITHUB_REPOSITORY/releases/download/v<version>/kraken-mount.elf` (repo default
+`quer3q/kraken-mount`), version `v<Cargo.toml version>`, `last_update` (`PAYLOADS_DATE`, default today UTC), a
+one-line description, category `Utilities & Tools`, checksum = sha256 of the ELF, author `quer3q`, source and
+details_url. The ELF must be named `kraken-mount.elf`. Written with printf, then parsed back (jq, else `python3 -I`).

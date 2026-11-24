@@ -228,11 +228,15 @@ fn is_backports(path: &Path) -> bool {
 /// (/mnt/usbN, /mnt/extN): its homebrew and etaHEN/games are roots of their own, and walking
 /// every top folder of a drive (Movies/...) each pass costs too much on USB. A game two folders
 /// down, or in another folder at a drive's root, needs its own scanpath line.
-fn candidates(root: &Path, roots: &[String], listed: &mut HashSet<PathBuf>, result: &mut ScanResult) -> (Vec<PathBuf>, Vec<PathBuf>) {
+fn candidates(root: &Path, roots: &[String], exclude: &[String], listed: &mut HashSet<PathBuf>, result: &mut ScanResult) -> (Vec<PathBuf>, Vec<PathBuf>) {
     let (mut top, mut nested) = (Vec::new(), Vec::new());
+    // Excluded paths are never opened: no listing, no scan error for an unreadable one.
+    if excluded(root, exclude) {
+        return (top, nested);
+    }
     let drive_root = root.parent() == Some(Path::new("/mnt"));
     for path in list(root, result).unwrap_or_default() {
-        if is_backports(&path) || !listed.insert(path.clone()) {
+        if is_backports(&path) || excluded(&path, exclude) || !listed.insert(path.clone()) {
             continue;
         }
         let descend = !drive_root && path.is_dir()
@@ -240,7 +244,7 @@ fn candidates(root: &Path, roots: &[String], listed: &mut HashSet<PathBuf>, resu
             && !roots.iter().any(|r| Path::new(r) == path);
         if descend {
             for child in list(&path, result).unwrap_or_default() {
-                if !is_backports(&child) && listed.insert(child.clone()) {
+                if !is_backports(&child) && !excluded(&child, exclude) && listed.insert(child.clone()) {
                     nested.push(child);
                 }
             }
@@ -250,9 +254,16 @@ fn candidates(root: &Path, roots: &[String], listed: &mut HashSet<PathBuf>, resu
     (top, nested)
 }
 
+/// Whether `path` is an `exclude` entry or lies under one (whole components, so /data/homebrew/A
+/// does not cover /data/homebrew/AB; a trailing `/` on an entry does not matter).
+pub fn excluded(path: &Path, exclude: &[String]) -> bool {
+    exclude.iter().any(|e| path.starts_with(e))
+}
+
 /// Finds the sources under `roots`: the .pkg files and game folders (eboot.bin and
 /// sce_sys/param.json) directly in a root, and those one folder below it (see `candidates`).
-pub fn scan(roots: &[String], backports: bool, stability_wait: u64) -> ScanResult {
+/// A source in `exclude` (see `excluded`) is skipped before it can claim its title id.
+pub fn scan(roots: &[String], exclude: &[String], backports: bool, stability_wait: u64) -> ScanResult {
     let mut result = ScanResult { games: Vec::new(), duplicates: Vec::new(), errors: Vec::new(), unstable: Vec::new() };
     // Title id -> (winner is a pkg, its index in `games`; None while the winner is still being copied).
     let mut seen: HashMap<String, (bool, Option<usize>)> = HashMap::new();
@@ -264,7 +275,7 @@ pub fn scan(roots: &[String], backports: bool, stability_wait: u64) -> ScanResul
     let (mut listed, mut order, mut later) = (HashSet::new(), Vec::new(), Vec::new());
     for root in roots {
         let root = Path::new(root);
-        let (top, nested) = candidates(root, roots, &mut listed, &mut result);
+        let (top, nested) = candidates(root, roots, exclude, &mut listed, &mut result);
         order.extend(top.into_iter().map(|p| (root, p, false)));
         later.extend(nested.into_iter().map(|p| (root, p, true)));
     }

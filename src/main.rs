@@ -17,6 +17,7 @@ mod net;
 mod register;
 mod scan;
 mod storage;
+mod update;
 mod web;
 
 use cache::Fresh;
@@ -41,10 +42,11 @@ fn toast(s: &Settings, msg: &str) {
 }
 
 /// What a failed game's retry waits for: another stamp, or any build input (pkg/folder files,
-/// backport, ampr dir) appearing, vanishing or changing mtime, or the game's PlayGo switch.
+/// backport, ampr dir) appearing, vanishing or changing mtime, or the game's PlayGo or overlay switch.
 fn inputs_key(src: &Source, s: &Settings) -> String {
     let mut k = cache::stamp(src, s).to_string();
     k += &format!("|playgo_off={}", s.playgo_off.contains(&src.title_id));
+    k += &format!("|overlay_off={}", s.overlay_off.contains(&src.title_id));
     for p in cache::inputs(src, s) {
         let mtime = std::fs::metadata(&p).and_then(|m| m.modified()).ok();
         k += &format!("|{}={mtime:?}", p.display());
@@ -392,25 +394,25 @@ fn should_update(inst: &Installed, tag: &str) -> bool {
 }
 
 #[derive(Debug, PartialEq)]
-struct Release {
-    tag: String,
-    url: String,
-    size: usize,
+pub(crate) struct Release {
+    pub(crate) tag: String,
+    pub(crate) url: String,
+    pub(crate) size: usize,
 }
 
-/// tag_name and the libSceAmpr.sprx asset of a GitHub releases/latest answer.
-fn parse_release(body: &[u8]) -> Result<Release, String> {
+/// tag_name and the `asset` asset of a GitHub releases/latest answer.
+pub(crate) fn parse_release(body: &[u8], asset: &str) -> Result<Release, String> {
     let j: serde_json::Value = serde_json::from_slice(body).map_err(|e| format!("bad JSON: {e}"))?;
     let tag = j["tag_name"].as_str().ok_or("no tag_name")?.to_string();
     let assets = j["assets"].as_array().ok_or("no assets")?;
-    let a = assets.iter().find(|a| a["name"].as_str() == Some(AMPR_ASSET)).ok_or(format!("{tag}: no {AMPR_ASSET} asset"))?;
+    let a = assets.iter().find(|a| a["name"].as_str() == Some(asset)).ok_or(format!("{tag}: no {asset} asset"))?;
     let url = a["browser_download_url"].as_str().ok_or("no browser_download_url")?.to_string();
     let size = a["size"].as_u64().and_then(|n| usize::try_from(n).ok()).ok_or("no asset size")?;
     Ok(Release { tag, url, size })
 }
 
 /// ELF or SELF (the signed form the PS5 loader also takes).
-fn is_module(b: &[u8]) -> bool {
+pub(crate) fn is_module(b: &[u8]) -> bool {
     b.starts_with(&[0x7f, 0x45, 0x4c, 0x46]) || b.starts_with(&[0x4f, 0x15, 0x3d, 0x1d])
 }
 
@@ -484,14 +486,14 @@ fn install_bundled_ampr() {
     }
 }
 
-/// net::https_get with up to `attempts` tries 20 s apart; each failure logged.
-fn get_retry(url: &str, max: usize, attempts: u32) -> Result<Vec<u8>, String> {
+/// net::https_get with up to `attempts` tries 20 s apart; each failure logged after `prefix`.
+pub(crate) fn get_retry(prefix: &str, url: &str, max: usize, attempts: u32) -> Result<Vec<u8>, String> {
     let mut last = String::new();
     for n in 1..=attempts {
         match net::https_get(url, max) {
             Ok(b) => return Ok(b),
             Err(e) => {
-                log!("ampr: update: GET {url} (attempt {n}/{attempts}): {e}");
+                log!("{prefix}: GET {url} (attempt {n}/{attempts}): {e}");
                 last = e.to_string();
             }
         }
@@ -534,8 +536,8 @@ fn ampr_update(state: &State, force: bool, attempts: u32) -> Result<String, Stri
 
 fn ampr_update_inner(state: &State, force: bool, attempts: u32) -> Result<String, String> {
     let path = format!("{}/{AMPR_ASSET}", cache::AMPR_DIR);
-    let body = get_retry(AMPR_RELEASE_URL, 1 << 20, attempts).map_err(|e| format!("GET {AMPR_RELEASE_URL}: {e}"))?;
-    let rel = parse_release(&body).map_err(|e| format!("{AMPR_RELEASE_URL}: {e}"))?;
+    let body = get_retry("ampr: update", AMPR_RELEASE_URL, 1 << 20, attempts).map_err(|e| format!("GET {AMPR_RELEASE_URL}: {e}"))?;
+    let rel = parse_release(&body, AMPR_ASSET).map_err(|e| format!("{AMPR_RELEASE_URL}: {e}"))?;
     let mark = std::fs::read_to_string(BUNDLED_MARK).ok();
     let (inst, _) = read_installed(&path, mark.as_deref()).map_err(|e| format!("read {path}: {e}"))?;
     if !force && !should_update(&inst, &rel.tag) {
@@ -549,7 +551,7 @@ fn ampr_update_inner(state: &State, force: bool, attempts: u32) -> Result<String
     if rel.size > AMPR_MAX {
         return Err(format!("{} asset is {} bytes, over {AMPR_MAX}", rel.tag, rel.size));
     }
-    let b = get_retry(&rel.url, AMPR_MAX, attempts).map_err(|e| format!("GET {}: {e}", rel.url))?;
+    let b = get_retry("ampr: update", &rel.url, AMPR_MAX, attempts).map_err(|e| format!("GET {}: {e}", rel.url))?;
     if b.len() != rel.size || !is_module(&b) {
         let magic = &b[..b.len().min(4)];
         return Err(format!(
@@ -768,6 +770,7 @@ fn main() {
     install_bundled_ampr();
     prepare_ampr();
     std::thread::spawn(save_self_copy);
+    update::spawn_check();
     // ponytail: debug turned on later takes effect at the next start.
     if s.debug {
         std::thread::spawn(klog_capture);
@@ -806,13 +809,25 @@ fn main() {
         }
         // Held to the end of the pass (dropped at `continue` and before the wait): /api/delete waits on it.
         let work = state.work.lock().unwrap();
+        // A self-update is under way: the new copy quits this one soon, not in the middle of a build.
+        if update::holding() {
+            drop(work);
+            state.busy.store(false, Ordering::SeqCst);
+            std::thread::sleep(Duration::from_secs(1));
+            continue;
+        }
         let pass = std::time::Instant::now();
-        let s = config::load();
+        // Loaded under the settings lock: web.rs change_settings (an exclusion) loads, saves and
+        // applies under it too, so this pass never puts an older copy back over a newer one.
+        let s = {
+            let mut cur = state.settings.lock().unwrap();
+            *cur = config::load();
+            cur.clone()
+        };
         sys::LOG_FILE.store(s.log, Ordering::Relaxed);
-        *state.settings.lock().unwrap() = s.clone();
         state.busy.store(true, Ordering::SeqCst);
         let roots = if s.scan_paths.is_empty() { storage::default_scan_roots() } else { s.scan_paths.clone() };
-        let r = scan::scan(&roots, s.backports, s.stability_wait_secs);
+        let r = scan::scan(&roots, &s.exclude, s.backports, s.stability_wait_secs);
         let scan_ms = pass.elapsed().as_millis();
         if state.paused() {
             continue;
@@ -850,6 +865,11 @@ fn main() {
                 log!("a game started; scan paused until it exits");
                 full = false;
                 break;
+            }
+            // Excluded since this pass loaded the settings (/api/v1/manual/remove, uninstall).
+            // ponytail: a title staged before the change is still installed by install_staged below.
+            if scan::excluded(&src.path, &state.settings.lock().unwrap().exclude) {
+                continue;
             }
             process(&state, &s, src, &mut registered, &mut failed, &mut staged);
         }

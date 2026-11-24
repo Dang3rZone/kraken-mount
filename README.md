@@ -18,6 +18,17 @@ For large, demanding games, use the zstd pack format: it performs better than FP
    - USB drive (`/mnt/usb0` to `/mnt/usb7`): `homebrew`, `etaHEN/games` or the drive root
 3. Each game gets a "<name> registered" notification and its own home-screen tile.
 
+Updates: at start Kraken Mount checks the latest release on GitHub. When a newer one is out, the
+web UI shows "Kraken Mount <version> is available"; **Update** downloads it and sends it to elfldr
+(port 9021), and the new copy takes over (close the running game first).
+
+To keep it updated with [ps5-payload-manager](https://github.com/itsPLK/ps5-payload-manager), add
+`https://github.com/quer3q/kraken-mount/releases/latest/download/payloads.json` as a custom
+repository. Each published release carries that catalog (the `.elf` and its SHA-256, which the
+manager checks on every download); `latest` is the newest release that is not a pre-release. The
+in-UI **Update** does not change the manager's copy: if the manager loads Kraken Mount at boot, it
+starts the version the manager last installed, so update it in the manager too.
+
 [ampr-emu-ng](https://github.com/quer3q/ampr-emu-ng) comes bundled and is installed into
 `/data/krakenmount/ampr/` at start. To run another build, put its `libSceAmpr.sprx` there; it is
 kept until you delete it.

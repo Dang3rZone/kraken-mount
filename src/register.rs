@@ -6,6 +6,7 @@
 //! nothing here reads it, so it is skipped.
 
 use crate::sys::nmount;
+use std::collections::HashSet;
 use std::ffi::{c_char, c_void, CStr, CString};
 use std::fs;
 use std::io::{self, ErrorKind};
@@ -406,12 +407,14 @@ pub fn install_all(title_ids: &[String]) -> io::Result<()> {
         fn sceAppInstUtilAppInstallAll(reserved: *mut c_void) -> i32;
     }
     let why = INSTALL_FN.get_or_init(resolve_install).as_ref().err().cloned().unwrap_or_default();
+    // Taken before the call: a tile staged while it runs (the tile thread) waits for the next pass
+    // instead of being marked registered by a call that never saw it.
+    // ponytail: taken either way: a failed tile keeps tile.ok "pending" and gets no retry until the
+    // next start, so a failing call does not repeat (~20 s) every pass.
+    let tile = TILE_STAGED.lock().unwrap().take();
     let t = std::time::Instant::now();
     let rc = unsafe { sceAppInstUtilAppInstallAll(ptr::null_mut()) } as u32;
     let ms = t.elapsed().as_millis();
-    // Taken either way: a failed tile keeps tile.ok "pending" and is retried at the next start, so a
-    // failing call does not repeat (~20 s) every pass.
-    let tile = TILE_STAGED.lock().unwrap().take();
     let ids: Vec<&str> = title_ids.iter().map(String::as_str).chain(tile.as_ref().map(|_| TILE_ID)).collect();
     log!("{}: {why}; sceAppInstUtilAppInstallAll: {rc:#x} ({ms} ms)", ids.join(", "));
     if rc != 0 {
@@ -543,6 +546,44 @@ pub fn is_registered(title_id: &str) -> bool {
             false
         }
     }
+}
+
+/// is_registered for many titles (web API status) with one pass over one app.db read, in `tids` order.
+
+static DB_READ_FAILED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// ponytail: read on every call (each /api/state poll); app.db is a few MB at most.
+pub fn registered(tids: &[&str]) -> Vec<bool> {
+    let staged: Vec<bool> = tids
+        .iter()
+        .map(|t| {
+            Path::new(APP_BASE).join(t).join("sce_sys/param.json").is_file()
+                && Path::new(APPMETA_BASE).join(t).join("param.json").is_file()
+        })
+        .collect();
+    if !staged.contains(&true) {
+        return staged;
+    }
+    let db = match fs::read(APP_DB) {
+        Ok(db) => db,
+        Err(e) => {
+            // Once until it reads again: /api/state polls this every second or two per open UI.
+            if !DB_READ_FAILED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                log!("read {APP_DB}: {e}; titles shown as not registered");
+            }
+            return vec![false; tids.len()];
+        }
+    };
+    DB_READ_FAILED.store(false, std::sync::atomic::Ordering::Relaxed);
+    let wanted: HashSet<&[u8]> = tids.iter().zip(&staged).filter(|(_, s)| **s).map(|(t, _)| t.as_bytes()).collect();
+    // Every TID-shaped 9-byte run of app.db (a TID is 9 bytes, crate::scan::valid_tid).
+    let mut found: HashSet<&[u8]> = HashSet::new();
+    for w in db.windows(9) {
+        if w[0].is_ascii_uppercase() && wanted.contains(w) {
+            found.insert(w);
+        }
+    }
+    tids.iter().zip(staged).map(|(t, s)| s && found.contains(t.as_bytes())).collect()
 }
 
 /// Only the nullfs `app0` -> /system_ex/app/<TID> (+ backport unionfs) of `register`, for a

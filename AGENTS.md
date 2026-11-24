@@ -33,10 +33,12 @@ sandbox. Web UI on port 8097 (opened from the "Kraken Mount" home-screen tile).
 | `src/launch.rs` | launch watcher: the fakelib overlay, writable `/app0`, `/app0/kraken` |
 | `src/web.rs`, `src/ui.html` | HTTP server and the single-file UI |
 | `src/sys.rs` | log, toasts, mount syscalls, kstuff probe |
-| `src/net.rs` | HTTPS GET over the console's sceHttp/sceSsl (ampr-emu-ng auto-update) |
+| `src/net.rs` | HTTPS GET over the console's sceHttp/sceSsl (ampr-emu-ng auto-update, self-update) |
+| `src/update.rs` | self-update: latest Kraken Mount release checked at start, `/api/self_update` sends it to elfldr |
 | `src/i18n.rs` | toast texts in the console language (the UI's 11 languages) |
 | `crates/kraken-mount-pkg` | FPKG reader and its Kraken decoder (`decoder` module) |
 | `ps5/` | Docker build, linker, C shims (`compat.c` holds PS5 libc adapters, `appdb.c` writes app.db through the SQLite amalgamation the Dockerfile fetches) |
+| `ps5/make-payloads-json.sh` | the release's `payloads.json` for ps5-payload-manager (run by the build.yml release job) |
 | `DESIGN.md` | the contract: paths, settings, cache rules, flow, module interfaces, web API |
 
 ## Build and check

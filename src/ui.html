@@ -321,6 +321,10 @@ button:disabled { opacity: 0.5; cursor: default; }
 .banner.ok { background: var(--glass); color: var(--fg); }
 .banner.show { display: block; }
 .banner:first-child { margin-top: 1rem; }
+#update.show { display: flex; align-items: center; flex-wrap: wrap; gap: 0.6rem 1rem; }
+#update-msg { flex: 1 1 16rem; }
+.banner-btns { display: flex; gap: 0.6rem; }
+.banner-btns button[hidden] { display: none; }
 .card .status-pill, .card .running-pill {
   position: absolute; right: 0.75rem; top: 0.75rem; max-width: calc(100% - 1.5rem);
   padding: 0.3rem 0.7rem; border-radius: 999px; font-size: 0.78rem; font-weight: 600;
@@ -415,6 +419,8 @@ button:disabled { opacity: 0.5; cursor: default; }
   <div class="banner warn" id="paused" role="status"></div>
   <div class="banner warn" id="waiting" role="status"></div>
   <div class="banner" id="eject" role="status"></div>
+  <div class="banner ok" id="update"><span id="update-msg" role="status"></span>
+    <span class="banner-btns"><button class="small primary" type="button" id="update-go">Update</button><button class="small" type="button" id="update-later">Later</button></span></div>
 </div>
 
 <main>
@@ -503,6 +509,9 @@ button:disabled { opacity: 0.5; cursor: default; }
       <label class="row m-row" id="m-playgo-row" hidden><span><span class="lbl" data-i18n="playgoStub">PlayGo stub</span>
         <span class="hint" data-i18n="playgoHint">Turn off if the game stays on a black screen; turn on if it asks to finish the download.</span></span>
         <input type="checkbox" id="m-playgo"></label>
+      <label class="row m-row" id="m-overlay-row" hidden><span><span class="lbl" data-i18n="overlayLbl">Kraken Mount libraries</span>
+        <span class="hint" data-i18n="overlayHint">Turn off only for apps that bring their own system libraries (Playden titles): the game then runs without ampr-emu-ng and the bundled emulators.</span></span>
+        <input type="checkbox" id="m-overlay"></label>
       <div class="m-err" id="m-err"></div>
     </div>
     <div class="storage-line">
@@ -563,6 +572,8 @@ var MSG = {
     emptyCopy: 'Copy {pkg} files or game folders to {dir} (or {usb} on a USB drive), then press Rescan.',
     emptyHome: 'Each game shows up here and on the home screen once it is registered.',
     showLog: 'Show log', hideLog: 'Hide log',
+    updAvail: 'Kraken Mount {v} is available.', updNow: 'Update', updLater: 'Later', updRetry: 'Retry',
+    updRunning: 'Updating to {v}... The page reloads once the new version runs.', updFailed: 'Update failed: {error}',
     // Game sheet
     delete: 'Delete', rebuildCache: 'Rebuild cache', close: 'Close', storage: 'Storage',
     fTitleId: 'Title ID', fVersion: 'Version', fStatus: 'Status', fType: 'Type', fDrive: 'Drive',
@@ -570,6 +581,7 @@ var MSG = {
     fCrash: 'Last crash', crashHint: 'The game crashed while running. That usually comes from the dump, ampr-emu-ng or the PlayGo stub, not the mount. Use Report when you open an issue.', report: 'Report',
     fBackport: 'Backport', yes: 'Yes', no: 'No', notBuilt: 'not built',
     playgoStub: 'PlayGo stub', playgoHint: 'Turn off if the game stays on a black screen; turn on if it asks to finish the download.',
+    overlayLbl: 'Kraken Mount libraries', overlayHint: 'Turn off only for apps that bring their own system libraries (Playden titles): the game then runs without ampr-emu-ng and the bundled emulators.',
     szGame: 'Game', szDlc: 'DLC', szSave: 'Save', szCache: 'Cache',
     szPart: '{part} {size}', szNa: '{part} n/a', szTotal: 'Total {size}',
     sizesNone: 'Sizes unavailable', sizesLoading: 'Loading sizes...',
@@ -653,12 +665,15 @@ var MSG = {
     emptyCopy: 'Скопируйте файлы {pkg} или папки игр в {dir} (или в {usb} на USB-накопителе), затем нажмите «Пересканировать».',
     emptyHome: 'Каждая игра появится здесь и на главном экране после регистрации.',
     showLog: 'Показать журнал', hideLog: 'Скрыть журнал',
+    updAvail: 'Доступна версия Kraken Mount {v}.', updNow: 'Обновить', updLater: 'Позже', updRetry: 'Повторить',
+    updRunning: 'Обновление до {v}... Страница перезагрузится, когда новая версия запустится.', updFailed: 'Не удалось обновить: {error}',
     delete: 'Удалить', rebuildCache: 'Пересобрать кеш', close: 'Закрыть', storage: 'Хранилище',
     fTitleId: 'Title ID', fVersion: 'Версия', fStatus: 'Статус', fType: 'Тип', fDrive: 'Накопитель',
     fPath: 'Путь', fCachePath: 'Путь кеша', fCacheSize: 'Размер кеша', fCacheBuilt: 'Кеш собран',
     fCrash: 'Последний сбой', crashHint: 'Игра упала во время работы. Обычно причина в дампе, ampr-emu-ng или заглушке PlayGo, а не в монтировании. Нажмите «Отчёт», когда создаёте issue.', report: 'Отчёт',
     fBackport: 'Бэкпорт', yes: 'Да', no: 'Нет', notBuilt: 'не собран',
     playgoStub: 'Заглушка PlayGo', playgoHint: 'Выключите, если игра остаётся на чёрном экране; включите, если она просит завершить загрузку.',
+    overlayLbl: 'Библиотеки Kraken Mount', overlayHint: 'Выключайте только для приложений со своими системными библиотеками (тайтлы Playden): тогда игра запускается без ampr-emu-ng и встроенных эмуляторов.',
     szGame: 'Игра', szDlc: 'DLC', szSave: 'Сохранения', szCache: 'Кеш',
     szPart: '{part} {size}', szNa: '{part} н/д', szTotal: 'Всего {size}',
     sizesNone: 'Размеры недоступны', sizesLoading: 'Загрузка размеров...',
@@ -740,12 +755,15 @@ var MSG = {
     emptyCopy: '将 {pkg} 文件或游戏文件夹复制到 {dir}（或 USB 驱动器上的 {usb}），然后按“重新扫描”。',
     emptyHome: '每个游戏注册后都会显示在这里和主屏幕上。',
     showLog: '显示日志', hideLog: '隐藏日志',
+    updAvail: 'Kraken Mount {v} 已发布。', updNow: '更新', updLater: '稍后', updRetry: '重试',
+    updRunning: '正在更新到 {v}... 新版本运行后页面会重新加载。', updFailed: '更新失败：{error}',
     delete: '删除', rebuildCache: '重建缓存', close: '关闭', storage: '存储',
     fTitleId: 'Title ID', fVersion: '版本', fStatus: '状态', fType: '类型', fDrive: '驱动器',
     fPath: '路径', fCachePath: '缓存路径', fCacheSize: '缓存大小', fCacheBuilt: '缓存构建时间',
     fCrash: '上次崩溃', crashHint: '游戏在运行时崩溃。原因通常是 dump、ampr-emu-ng 或 PlayGo 存根，而不是挂载。提交 issue 时请使用“报告”。', report: '报告',
     fBackport: '向下移植', yes: '是', no: '否', notBuilt: '未构建',
     playgoStub: 'PlayGo 存根', playgoHint: '如果游戏停留在黑屏，请关闭；如果游戏要求完成下载，请开启。',
+    overlayLbl: 'Kraken Mount 库', overlayHint: '仅对自带系统库的应用（Playden 游戏）关闭：关闭后游戏将在没有 ampr-emu-ng 和内置模拟器的情况下运行。',
     szGame: '游戏', szDlc: 'DLC', szSave: '存档', szCache: '缓存',
     szPart: '{part} {size}', szNa: '{part} 不可用', szTotal: '总计 {size}',
     sizesNone: '大小不可用', sizesLoading: '正在加载大小...',
@@ -827,12 +845,15 @@ var MSG = {
     emptyCopy: 'Kopieren Sie {pkg}-Dateien oder Spielordner nach {dir} (oder {usb} auf einem USB-Laufwerk) und drücken Sie dann „Neu scannen“.',
     emptyHome: 'Jedes Spiel erscheint hier und auf dem Startbildschirm, sobald es registriert ist.',
     showLog: 'Protokoll anzeigen', hideLog: 'Protokoll ausblenden',
+    updAvail: 'Kraken Mount {v} ist verfügbar.', updNow: 'Aktualisieren', updLater: 'Später', updRetry: 'Erneut versuchen',
+    updRunning: 'Aktualisierung auf {v}... Die Seite lädt neu, sobald die neue Version läuft.', updFailed: 'Aktualisierung fehlgeschlagen: {error}',
     delete: 'Löschen', rebuildCache: 'Cache neu erstellen', close: 'Schließen', storage: 'Speicher',
     fTitleId: 'Title ID', fVersion: 'Version', fStatus: 'Status', fType: 'Typ', fDrive: 'Laufwerk',
     fPath: 'Pfad', fCachePath: 'Cache-Pfad', fCacheSize: 'Cache-Größe', fCacheBuilt: 'Cache erstellt',
     fCrash: 'Letzter Absturz', crashHint: 'Das Spiel ist während des Spielens abgestürzt. Meist liegt es am Dump, an ampr-emu-ng oder am PlayGo-Stub, nicht am Einbinden. Nutze „Bericht“, wenn du ein Issue eröffnest.', report: 'Bericht',
     fBackport: 'Backport', yes: 'Ja', no: 'Nein', notBuilt: 'nicht erstellt',
     playgoStub: 'PlayGo-Stub', playgoHint: 'Ausschalten, wenn das Spiel auf einem schwarzen Bildschirm bleibt; einschalten, wenn es verlangt, den Download abzuschließen.',
+    overlayLbl: 'Kraken Mount-Bibliotheken', overlayHint: 'Nur für Apps ausschalten, die eigene Systembibliotheken mitbringen (Playden-Titel): Das Spiel läuft dann ohne ampr-emu-ng und die mitgelieferten Emulatoren.',
     szGame: 'Spiel', szDlc: 'DLC', szSave: 'Spielstand', szCache: 'Cache',
     szPart: '{part} {size}', szNa: '{part} k. A.', szTotal: 'Gesamt {size}',
     sizesNone: 'Größen nicht verfügbar', sizesLoading: 'Größen werden geladen...',
@@ -914,12 +935,15 @@ var MSG = {
     emptyCopy: 'Copia archivos {pkg} o carpetas de juegos en {dir} (o en {usb} en una unidad USB) y pulsa Volver a escanear.',
     emptyHome: 'Cada juego aparece aquí y en la pantalla de inicio cuando se registra.',
     showLog: 'Mostrar registro', hideLog: 'Ocultar registro',
+    updAvail: 'Kraken Mount {v} está disponible.', updNow: 'Actualizar', updLater: 'Más tarde', updRetry: 'Reintentar',
+    updRunning: 'Actualizando a {v}... La página se recarga cuando la nueva versión esté en marcha.', updFailed: 'Error al actualizar: {error}',
     delete: 'Eliminar', rebuildCache: 'Recrear caché', close: 'Cerrar', storage: 'Almacenamiento',
     fTitleId: 'Title ID', fVersion: 'Versión', fStatus: 'Estado', fType: 'Tipo', fDrive: 'Unidad',
     fPath: 'Ruta', fCachePath: 'Ruta de caché', fCacheSize: 'Tamaño de caché', fCacheBuilt: 'Caché creada',
     fCrash: 'Último cierre inesperado', crashHint: 'El juego falló mientras se ejecutaba. Suele deberse al dump, a ampr-emu-ng o al stub de PlayGo, no al montaje. Usa Informe al abrir un issue.', report: 'Informe',
     fBackport: 'Backport', yes: 'Sí', no: 'No', notBuilt: 'sin crear',
     playgoStub: 'Stub de PlayGo', playgoHint: 'Desactívalo si el juego se queda en pantalla negra; actívalo si pide terminar la descarga.',
+    overlayLbl: 'Bibliotecas de Kraken Mount', overlayHint: 'Desactívalo solo para apps que traen sus propias bibliotecas del sistema (títulos de Playden): el juego se ejecuta entonces sin ampr-emu-ng ni los emuladores incluidos.',
     szGame: 'Juego', szDlc: 'DLC', szSave: 'Partidas', szCache: 'Caché',
     szPart: '{part} {size}', szNa: '{part} n/d', szTotal: 'Total {size}',
     sizesNone: 'Tamaños no disponibles', sizesLoading: 'Cargando tamaños...',
@@ -1001,12 +1025,15 @@ var MSG = {
     emptyCopy: 'Copiez des fichiers {pkg} ou des dossiers de jeux dans {dir} (ou {usb} sur une clé USB), puis appuyez sur Réanalyser.',
     emptyHome: "Chaque jeu apparaît ici et sur l'écran d'accueil une fois enregistré.",
     showLog: 'Afficher le journal', hideLog: 'Masquer le journal',
+    updAvail: 'Kraken Mount {v} est disponible.', updNow: 'Mettre à jour', updLater: 'Plus tard', updRetry: 'Réessayer',
+    updRunning: 'Mise à jour vers {v}... La page se recharge dès que la nouvelle version tourne.', updFailed: 'Échec de la mise à jour : {error}',
     delete: 'Supprimer', rebuildCache: 'Recréer le cache', close: 'Fermer', storage: 'Stockage',
     fTitleId: 'Title ID', fVersion: 'Version', fStatus: 'État', fType: 'Type', fDrive: 'Disque',
     fPath: 'Chemin', fCachePath: 'Chemin du cache', fCacheSize: 'Taille du cache', fCacheBuilt: 'Cache créé',
     fCrash: 'Dernier plantage', crashHint: 'Le jeu a planté pendant l\'exécution. La cause est souvent le dump, ampr-emu-ng ou le stub PlayGo, pas le montage. Utilisez Rapport pour ouvrir une issue.', report: 'Rapport',
     fBackport: 'Backport', yes: 'Oui', no: 'Non', notBuilt: 'non créé',
     playgoStub: 'Stub PlayGo', playgoHint: "Désactivez-le si le jeu reste sur un écran noir ; activez-le s'il demande de terminer le téléchargement.",
+    overlayLbl: 'Bibliothèques Kraken Mount', overlayHint: "Désactivez-les uniquement pour les apps qui apportent leurs propres bibliothèques système (titres Playden) : le jeu tourne alors sans ampr-emu-ng ni les émulateurs fournis.",
     szGame: 'Jeu', szDlc: 'DLC', szSave: 'Sauvegarde', szCache: 'Cache',
     szPart: '{part} {size}', szNa: '{part} n/d', szTotal: 'Total {size}',
     sizesNone: 'Tailles indisponibles', sizesLoading: 'Chargement des tailles...',
@@ -1088,12 +1115,15 @@ var MSG = {
     emptyCopy: '{pkg} ファイルまたはゲームフォルダーを {dir}（USB ドライブでは {usb}）にコピーしてから「再スキャン」を押してください。',
     emptyHome: '各ゲームは登録されるとここにもホーム画面にも表示されます。',
     showLog: 'ログを表示', hideLog: 'ログを隠す',
+    updAvail: 'Kraken Mount {v} が利用可能です。', updNow: '更新', updLater: '後で', updRetry: '再試行',
+    updRunning: '{v} に更新しています... 新しいバージョンが起動するとページが再読み込みされます。', updFailed: '更新に失敗しました: {error}',
     delete: '削除', rebuildCache: 'キャッシュを再作成', close: '閉じる', storage: 'ストレージ',
     fTitleId: 'Title ID', fVersion: 'バージョン', fStatus: '状態', fType: '種類', fDrive: 'ドライブ',
     fPath: 'パス', fCachePath: 'キャッシュのパス', fCacheSize: 'キャッシュのサイズ', fCacheBuilt: 'キャッシュ作成日時',
     fCrash: '最後のクラッシュ', crashHint: 'ゲームが実行中にクラッシュしました。原因は多くの場合ダンプ、ampr-emu-ng、PlayGo スタブで、マウントではありません。issue を作るときは「レポート」を使ってください。', report: 'レポート',
     fBackport: 'バックポート', yes: 'はい', no: 'いいえ', notBuilt: '未作成',
     playgoStub: 'PlayGo スタブ', playgoHint: 'ゲームが黒い画面のままならオフに、ダウンロードの完了を求められたらオンにします。',
+    overlayLbl: 'Kraken Mount のライブラリ', overlayHint: '独自のシステムライブラリを持つアプリ（Playden のタイトル）の場合のみオフにします。オフにするとゲームは ampr-emu-ng と同梱のエミュレーターなしで動作します。',
     szGame: 'ゲーム', szDlc: 'DLC', szSave: 'セーブ', szCache: 'キャッシュ',
     szPart: '{part} {size}', szNa: '{part} 不明', szTotal: '合計 {size}',
     sizesNone: 'サイズを取得できません', sizesLoading: 'サイズを読み込んでいます...',
@@ -1175,12 +1205,15 @@ var MSG = {
     emptyCopy: 'Copie arquivos {pkg} ou pastas de jogos para {dir} (ou {usb} em um drive USB) e pressione Escanear de novo.',
     emptyHome: 'Cada jogo aparece aqui e na tela inicial assim que é registrado.',
     showLog: 'Mostrar log', hideLog: 'Ocultar log',
+    updAvail: 'Kraken Mount {v} está disponível.', updNow: 'Atualizar', updLater: 'Depois', updRetry: 'Tentar de novo',
+    updRunning: 'Atualizando para {v}... A página recarrega quando a nova versão estiver rodando.', updFailed: 'Falha na atualização: {error}',
     delete: 'Excluir', rebuildCache: 'Recriar cache', close: 'Fechar', storage: 'Armazenamento',
     fTitleId: 'Title ID', fVersion: 'Versão', fStatus: 'Status', fType: 'Tipo', fDrive: 'Drive',
     fPath: 'Caminho', fCachePath: 'Caminho do cache', fCacheSize: 'Tamanho do cache', fCacheBuilt: 'Cache criado',
     fCrash: 'Última falha', crashHint: 'O jogo falhou durante a execução. Geralmente a causa é o dump, o ampr-emu-ng ou o stub do PlayGo, não a montagem. Use Relatório ao abrir uma issue.', report: 'Relatório',
     fBackport: 'Backport', yes: 'Sim', no: 'Não', notBuilt: 'não criado',
     playgoStub: 'Stub do PlayGo', playgoHint: 'Desligue se o jogo ficar na tela preta; ligue se ele pedir para concluir o download.',
+    overlayLbl: 'Bibliotecas do Kraken Mount', overlayHint: 'Desligue só para apps que trazem as próprias bibliotecas do sistema (títulos do Playden): o jogo então roda sem o ampr-emu-ng e os emuladores incluídos.',
     szGame: 'Jogo', szDlc: 'DLC', szSave: 'Salvamento', szCache: 'Cache',
     szPart: '{part} {size}', szNa: '{part} n/d', szTotal: 'Total {size}',
     sizesNone: 'Tamanhos indisponíveis', sizesLoading: 'Carregando tamanhos...',
@@ -1262,12 +1295,15 @@ var MSG = {
     emptyCopy: 'Copia file {pkg} o cartelle di giochi in {dir} (o in {usb} su un\'unità USB), poi premi Ripeti scansione.',
     emptyHome: 'Ogni gioco compare qui e nella schermata Home una volta registrato.',
     showLog: 'Mostra registro', hideLog: 'Nascondi registro',
+    updAvail: 'Kraken Mount {v} è disponibile.', updNow: 'Aggiorna', updLater: 'Più tardi', updRetry: 'Riprova',
+    updRunning: 'Aggiornamento a {v}... La pagina si ricarica quando la nuova versione è in esecuzione.', updFailed: 'Aggiornamento non riuscito: {error}',
     delete: 'Elimina', rebuildCache: 'Ricrea cache', close: 'Chiudi', storage: 'Archiviazione',
     fTitleId: 'Title ID', fVersion: 'Versione', fStatus: 'Stato', fType: 'Tipo', fDrive: 'Unità',
     fPath: 'Percorso', fCachePath: 'Percorso cache', fCacheSize: 'Dimensione cache', fCacheBuilt: 'Cache creata',
     fCrash: 'Ultimo crash', crashHint: 'Il gioco è andato in crash durante l\'esecuzione. Di solito la causa è il dump, ampr-emu-ng o lo stub PlayGo, non il montaggio. Usa Report quando apri una issue.', report: 'Report',
     fBackport: 'Backport', yes: 'Sì', no: 'No', notBuilt: 'non creata',
     playgoStub: 'Stub PlayGo', playgoHint: 'Disattivalo se il gioco resta su schermo nero; attivalo se chiede di completare il download.',
+    overlayLbl: 'Librerie di Kraken Mount', overlayHint: 'Disattivale solo per le app che portano le proprie librerie di sistema (titoli Playden): il gioco gira allora senza ampr-emu-ng e gli emulatori inclusi.',
     szGame: 'Gioco', szDlc: 'DLC', szSave: 'Salvataggi', szCache: 'Cache',
     szPart: '{part} {size}', szNa: '{part} n/d', szTotal: 'Totale {size}',
     sizesNone: 'Dimensioni non disponibili', sizesLoading: 'Caricamento delle dimensioni...',
@@ -1349,12 +1385,15 @@ var MSG = {
     emptyCopy: '{pkg} 파일이나 게임 폴더를 {dir}(USB 드라이브에서는 {usb})에 복사한 다음 다시 스캔을 누르세요.',
     emptyHome: '각 게임은 등록되면 여기와 홈 화면에 나타납니다.',
     showLog: '로그 표시', hideLog: '로그 숨기기',
+    updAvail: 'Kraken Mount {v}을(를) 사용할 수 있습니다.', updNow: '업데이트', updLater: '나중에', updRetry: '다시 시도',
+    updRunning: '{v}(으)로 업데이트하는 중... 새 버전이 실행되면 페이지가 다시 로드됩니다.', updFailed: '업데이트 실패: {error}',
     delete: '삭제', rebuildCache: '캐시 다시 생성', close: '닫기', storage: '저장소',
     fTitleId: 'Title ID', fVersion: '버전', fStatus: '상태', fType: '유형', fDrive: '드라이브',
     fPath: '경로', fCachePath: '캐시 경로', fCacheSize: '캐시 크기', fCacheBuilt: '캐시 생성 시각',
     fCrash: '마지막 충돌', crashHint: '게임이 실행 중에 충돌했습니다. 원인은 보통 덤프, ampr-emu-ng 또는 PlayGo 스텁이며 마운트가 아닙니다. issue를 열 때 \'보고서\'를 사용하세요.', report: '보고서',
     fBackport: '백포트', yes: '예', no: '아니요', notBuilt: '생성 안 됨',
     playgoStub: 'PlayGo 스텁', playgoHint: '게임이 검은 화면에서 멈추면 끄고, 다운로드를 완료하라고 하면 켜세요.',
+    overlayLbl: 'Kraken Mount 라이브러리', overlayHint: '자체 시스템 라이브러리를 포함한 앱(Playden 타이틀)에서만 끄세요. 끄면 게임이 ampr-emu-ng와 내장 에뮬레이터 없이 실행됩니다.',
     szGame: '게임', szDlc: 'DLC', szSave: '세이브', szCache: '캐시',
     szPart: '{part} {size}', szNa: '{part} 해당 없음', szTotal: '합계 {size}',
     sizesNone: '크기를 알 수 없음', sizesLoading: '크기를 불러오는 중...',
@@ -1436,12 +1475,15 @@ var MSG = {
     emptyCopy: 'انسخ ملفات {pkg} أو مجلدات الألعاب إلى {dir} (أو {usb} على محرك USB)، ثم اضغط إعادة المسح.',
     emptyHome: 'تظهر كل لعبة هنا وعلى الشاشة الرئيسية بعد تسجيلها.',
     showLog: 'إظهار السجل', hideLog: 'إخفاء السجل',
+    updAvail: 'الإصدار {v} من Kraken Mount متاح.', updNow: 'تحديث', updLater: 'لاحقًا', updRetry: 'إعادة المحاولة',
+    updRunning: 'جارٍ التحديث إلى {v}... ستُعاد تحميل الصفحة بعد تشغيل الإصدار الجديد.', updFailed: 'فشل التحديث: {error}',
     delete: 'حذف', rebuildCache: 'إعادة إنشاء الذاكرة المؤقتة', close: 'إغلاق', storage: 'التخزين',
     fTitleId: 'Title ID', fVersion: 'الإصدار', fStatus: 'الحالة', fType: 'النوع', fDrive: 'المحرك',
     fPath: 'المسار', fCachePath: 'مسار الذاكرة المؤقتة', fCacheSize: 'حجم الذاكرة المؤقتة', fCacheBuilt: 'أُنشئت الذاكرة المؤقتة',
     fCrash: 'آخر تعطّل', crashHint: 'تعطّلت اللعبة أثناء التشغيل. السبب عادةً النسخة (dump) أو ampr-emu-ng أو بديل PlayGo، وليس التحميل. استخدم «تقرير» عند فتح issue.', report: 'تقرير',
     fBackport: 'الباكبورت', yes: 'نعم', no: 'لا', notBuilt: 'لم تُنشأ',
     playgoStub: 'بديل PlayGo', playgoHint: 'أوقفه إذا بقيت اللعبة على شاشة سوداء، وشغّله إذا طلبت إكمال التنزيل.',
+    overlayLbl: 'مكتبات Kraken Mount', overlayHint: 'أوقفها فقط للتطبيقات التي تأتي بمكتبات النظام الخاصة بها (عناوين Playden): عندها تعمل اللعبة بدون ampr-emu-ng والمحاكيات المرفقة.',
     szGame: 'اللعبة', szDlc: 'DLC', szSave: 'الحفظ', szCache: 'الذاكرة المؤقتة',
     szPart: '{part} {size}', szNa: '{part} غير متاح', szTotal: 'الإجمالي {size}',
     sizesNone: 'الأحجام غير متاحة', sizesLoading: 'جارٍ تحميل الأحجام...',
@@ -2003,9 +2045,15 @@ function renderModal() {
   $('m-play').disabled = g.status !== 'ready' || !!state.paused || Date.now() < ($('m-play')._until || 0);
   // The PlayGo switch: only for a game whose eboot imports PlayGo, or one turned off already.
   var pg = $('m-playgo');
-  $('m-playgo-row').hidden = !(g.playgo === true || g.playgo_off);
+  // Not with the overlay off: its fakelib/ stays empty, so the stub switch would do nothing.
+  $('m-playgo-row').hidden = !(g.playgo === true || g.playgo_off) || (g.kind === 'folder' && !!g.overlay_off);
   if (!pg._busy) pg.checked = !g.playgo_off;
   pg.disabled = !!pg._busy || g.status === 'duplicate' || g.status === 'building';
+  // The overlay switch: folder games only (a pkg needs ampr-emu-ng's pkg mode).
+  var ov = $('m-overlay');
+  $('m-overlay-row').hidden = g.kind !== 'folder';
+  if (!ov._busy) ov.checked = !g.overlay_off;
+  ov.disabled = !!ov._busy || g.status === 'duplicate' || g.status === 'building';
 }
 function renderSizes(sizes) {
   var stack = $('m-stack'), legend = $('m-legend');
@@ -2096,17 +2144,18 @@ $('m-play').onclick = async function () {
   if (modalOpen()) renderModal();
   schedule(300);
 };
-$('m-playgo').onchange = async function () {
-  var box = this, g = openTid && findGame(openTid);
+// A per-title switch of the sheet: posts on/off to /api/<route>/<TID>; field is the game's *_off flag.
+async function postSwitch(box, route, field) {
+  var g = openTid && findGame(openTid);
   if (!g) return;
   var id = gameId(g), on = box.checked;
   box._busy = true;
   box.disabled = true;
   try {
-    var r = await fetch('/api/playgo/' + encodeURIComponent(g.title_id), { method: 'POST', body: on ? 'on' : 'off' });
+    var r = await fetch('/api/' + route + '/' + encodeURIComponent(g.title_id), { method: 'POST', body: on ? 'on' : 'off' });
     if (!r.ok) throw new Error((await r.text()) || 'HTTP ' + r.status);
     // Until the next state arrives, draw the new value.
-    g.playgo_off = !on;
+    g[field] = !on;
     modalActionError = '';
     if (state && state.paused) { queued = true; setBanner('paused', true, pausedText); }
   } catch (e) {
@@ -2115,10 +2164,12 @@ $('m-playgo').onchange = async function () {
   box._busy = false;
   if (modalOpen() && openTid === id) {
     renderModal();
-    if (!box.disabled && !$('m-playgo-row').hidden) box.focus();
+    if (!box.disabled && !box.parentNode.hidden) box.focus();
   }
   schedule(300);
-};
+}
+$('m-playgo').onchange = function () { postSwitch(this, 'playgo', 'playgo_off'); };
+$('m-overlay').onchange = function () { postSwitch(this, 'overlay', 'overlay_off'); };
 $('m-delete').onclick = function () {
   var g = openTid && findGame(openTid);
   if (!g) return;
@@ -2191,7 +2242,10 @@ async function poll() {
     var r = await fetch('/api/state', { cache: 'no-store' });
     if (!r.ok) throw new Error('HTTP ' + r.status);
     state = await r.json();
+    if (upd.from && state.version && state.version !== upd.from) { location.reload(); return; }
+    updTimedOut();
     setBanner('offline', false);
+    renderUpdate();
     var cache = state.cache || {};
     setBanner('lowspace', !!cache.low_space, function () { return t('lowSpace', { free: gb(cache.free) }); });
     setBanner('noampr', cache.ampr_present === false);
@@ -2214,9 +2268,76 @@ async function poll() {
   } catch (e) {
     if (stopped) return;
     setBanner('offline', true);
-    if (LOOPBACK && !launchTried) await startPayload();
+    // During a self-update the new copy is on its way: starting the saved (old) copy would race it.
+    if (updTimedOut()) renderUpdate();
+    if (LOOPBACK && !launchTried && !upd.busy) await startPayload();
   }
   if (!stopped) schedule(2000);
+}
+
+// The new copy had 2 minutes to answer with its version (polls failing or not): show the error.
+function updTimedOut() {
+  if (!(upd.busy && upd.until && Date.now() > upd.until)) return false;
+  upd.busy = false; upd.until = 0; upd.from = null;
+  upd.error = 'Kraken Mount ' + upd.v + ' did not start (see kraken.log)';
+  return true;
+}
+// The self-update notice (state.update). Later hides it until the page reloads.
+// from: the running version when Update was pressed; a poll that sees another version reloads the page.
+// ponytail: no time limit; a new copy that never starts leaves "Updating..." under the offline banner.
+var upd = { v: '', hidden: false, busy: false, error: '', from: null };
+function renderUpdate() {
+  var u = state && state.update;
+  if (u && u.version && !upd.busy) upd.v = String(u.version);
+  var show = upd.busy || !!(u && u.version && (upd.error || !upd.hidden));
+  live($('update-msg'), !show ? null : function () {
+    return upd.error ? t('updFailed', { error: upd.error }) : t(upd.busy ? 'updRunning' : 'updAvail', { v: upd.v });
+  });
+  $('update').classList.toggle('show', show);
+  setText($('update-go'), t(upd.error ? 'updRetry' : 'updNow'));
+  setText($('update-later'), t(upd.error ? 'close' : 'updLater'));
+  $('update-go').hidden = $('update-later').hidden = upd.busy;
+}
+async function runSelfUpdate() {
+  if (upd.busy || !upd.v) return;
+  // Keep D-pad focus: the banner buttons hide while it runs.
+  if (bannerButtons().indexOf(document.activeElement) >= 0) document.querySelector('.nav [aria-selected="true"]').focus();
+  upd.busy = true;
+  upd.error = '';
+  upd.from = state && state.version;
+  renderUpdate();
+  try {
+    var r = await fetch('/api/self_update', { method: 'POST', body: JSON.stringify({ version: upd.v }) });
+    if (!r.ok) throw new Error((await r.text()) || 'HTTP ' + r.status);
+  } catch (e) {
+    upd.busy = false;
+    upd.error = e.message;
+    renderUpdate();
+    $('update-go').focus();
+    return;
+  }
+  // The new copy has 2 minutes to answer with its version (it may wait for a scan pass).
+  upd.until = Date.now() + 120000;
+  schedule(1000);
+}
+$('update-go').onclick = runSelfUpdate;
+$('update-later').onclick = function () {
+  var had = document.activeElement === this;
+  upd.hidden = true;
+  upd.error = '';
+  renderUpdate();
+  if (had) document.querySelector('.nav [aria-selected="true"]').focus();
+};
+function bannerButtons() {
+  if (!$('update').classList.contains('show')) return [];
+  return [$('update-go'), $('update-later')].filter(function (b) { return !b.hidden; });
+}
+function moveInBanner(btn, key) {
+  var row = bannerButtons(), i = row.indexOf(btn);
+  if (key === 'ArrowRight' && row[i + 1]) row[i + 1].focus();
+  else if (key === 'ArrowLeft' && row[i - 1]) row[i - 1].focus();
+  else if (key === 'ArrowUp') document.querySelector('.nav [aria-selected="true"]').focus();
+  else if (key === 'ArrowDown') { if ($('library').hidden) fields()[0].focus(); else focusChip(); }
 }
 
 // ---- chunk 3: settings, log, views, keys ----
@@ -2373,7 +2494,8 @@ function moveInSeg(btn, key) {
     if (key === 'ArrowDown') $('q').focus();
     if (key === 'ArrowUp') document.querySelector('.nav [aria-selected="true"]').focus();
   } else if (key === 'ArrowDown') {
-    if ($('library').hidden) fields()[0].focus(); else focusChip();
+    if (bannerButtons().length) bannerButtons()[0].focus();
+    else if ($('library').hidden) fields()[0].focus(); else focusChip();
   }
 }
 // The drive chips and the Unmount button, right of the type chips.
@@ -2421,10 +2543,10 @@ function moveInSettings(t, key) {
   else if (list[i + (key === 'ArrowUp' ? -1 : 1)]) list[i + (key === 'ArrowUp' ? -1 : 1)].focus();
   return true;
 }
-// The game sheet's controls in page order: its enabled buttons and the PlayGo switch when shown.
+// The game sheet's controls in page order: its enabled buttons and the switches (PlayGo, overlay) when shown.
 function modalControls() {
   return Array.prototype.slice.call(document.querySelectorAll('#modal button:not([disabled]), #modal input:not([disabled])'))
-    .filter(function (c) { return c.id !== 'm-playgo' || !$('m-playgo-row').hidden; });
+    .filter(function (c) { return c.tagName !== 'INPUT' || !c.parentNode.hidden; });
 }
 function moveInModal(key) {
   var list = modalControls();
@@ -2487,12 +2609,15 @@ document.addEventListener('keydown', function (e) {
   if (t.classList.contains('card')) { e.preventDefault(); moveInGrid(t, k); }
   else if (t.classList.contains('seg-opt')) { e.preventDefault(); moveInSeg(t, k); }
   else if (t.parentNode && t.parentNode.id === 'storage') { e.preventDefault(); moveInStorage(t, k); }
+  else if (t.parentNode && t.parentNode.classList.contains('banner-btns')) { e.preventDefault(); moveInBanner(t, k); }
   else if ((k === 'ArrowLeft' || k === 'ArrowRight') && t.parentNode.classList.contains('top-actions')) {
     e.preventDefault(); moveInTop(t, k);
   }
   else if (k === 'ArrowDown' && document.querySelector('.topbar').contains(t)) {
     e.preventDefault();
-    if ($('library').hidden) fields()[0].focus(); else focusChip();
+    // The update notice sits between the top bar and the page.
+    if (bannerButtons().length) bannerButtons()[0].focus();
+    else if ($('library').hidden) fields()[0].focus(); else focusChip();
   }
 });
 document.addEventListener('focusin', function (e) {
@@ -2508,6 +2633,7 @@ function renderAll() {
   fillLangSelect();
   setText($('logtoggle'), t(logOpen ? 'hideLog' : 'showLog'));
   ['offline', 'lowspace', 'paused', 'smsg', 'eject'].forEach(function (id) { if ($(id)._live) live($(id), $(id)._live); });
+  renderUpdate();
   if (state) {
     var games = Array.isArray(state.games) ? state.games : [];
     renderChips(games);
