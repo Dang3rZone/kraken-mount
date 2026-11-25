@@ -511,23 +511,18 @@ fn is_ours_in(root: &Path, title_id: &str) -> Result<(), PathBuf> {
 extern "C" {
     /// ps5/appdb.c: one statement with ?1 = `arg`; rows changed, or -1 with the error in `err`.
     fn km_sqlite_exec1(path: *const c_char, sql: *const c_char, arg: *const c_char, err: *mut c_char, errlen: usize) -> i32;
-    /// ps5/appdb.c: one statement across `count` ?1 args on a single connection.
-    fn km_sqlite_exec_many(
-        path: *const c_char,
-        sql: *const c_char,
-        args: *const *const c_char,
-        count: usize,
-        err: *mut c_char,
-        errlen: usize,
-    ) -> i32;
 }
 
 /// The scan thread and the launch watcher both write app.db.
 static APP_DB_LOCK: Mutex<()> = Mutex::new(());
 
 const APP_DB_WAL: &str = "/system_data/priv/mms/app.db-wal";
-const SND0_SQL: &str = "UPDATE tbl_contentinfo SET snd0info = '/user/appmeta/' || ?1 || '/snd0.at9' \
-    WHERE titleId = ?1 AND snd0info IS NOT '/user/appmeta/' || ?1 || '/snd0.at9'";
+/// ?1 = comma-joined title ids: one statement, so one write transaction for any number of titles
+/// (a no-op UPDATE still takes the write lock). ponytail: instr() scans tbl_contentinfo (a few
+/// hundred rows); title ids are [A-Z0-9], never a comma.
+const SND0_SQL: &str = "UPDATE tbl_contentinfo SET snd0info = '/user/appmeta/' || titleId || '/snd0.at9' \
+    WHERE instr(',' || ?1 || ',', ',' || titleId || ',') > 0 \
+    AND snd0info IS NOT '/user/appmeta/' || titleId || '/snd0.at9'";
 
 type DbStamp = (Option<(SystemTime, u64)>, Option<(SystemTime, u64)>);
 static LAST_APP_DB_STAMP: Mutex<Option<DbStamp>> = Mutex::new(None);
@@ -542,85 +537,55 @@ fn app_db_stamp() -> DbStamp {
     (file_stamp(APP_DB), file_stamp(APP_DB_WAL))
 }
 
-fn exec_snd0info_batch(tids: &[&str], label: &str) -> bool {
-    let c_tids: Vec<CString> = tids
-        .iter()
-        .filter(|tid| Path::new(APPMETA_BASE).join(tid).join("snd0.at9").is_file())
-        .filter_map(|tid| CString::new(*tid).ok())
-        .collect();
-    if c_tids.is_empty() {
+fn has_snd0(tid: &str) -> bool {
+    Path::new(APPMETA_BASE).join(tid).join("snd0.at9").is_file()
+}
+
+/// One UPDATE for every title in `tids` with a snd0.at9. False when it failed (logged).
+fn exec_snd0info(tids: &[&str]) -> bool {
+    let ids = tids.iter().copied().filter(|t| has_snd0(t)).collect::<Vec<_>>().join(",");
+    if ids.is_empty() {
         return true;
     }
-    let (Ok(path), Ok(sql)) = (CString::new(APP_DB), CString::new(SND0_SQL)) else {
+    let (Ok(path), Ok(sql), Ok(arg)) = (CString::new(APP_DB), CString::new(SND0_SQL), CString::new(ids.as_str())) else {
         return false;
     };
-    let ptrs: Vec<*const c_char> = c_tids.iter().map(|s| s.as_ptr()).collect();
     let mut msg = [0 as c_char; 256];
-    let mut last_err = String::new();
-    for delay_ms in [0u64, 350, 700] {
-        if delay_ms > 0 {
-            std::thread::sleep(std::time::Duration::from_millis(delay_ms));
-        }
-        let rows = {
-            let _guard = APP_DB_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-            unsafe {
-                km_sqlite_exec_many(
-                    path.as_ptr(),
-                    sql.as_ptr(),
-                    ptrs.as_ptr(),
-                    ptrs.len(),
-                    msg.as_mut_ptr(),
-                    msg.len(),
-                )
-            }
-        };
-        if rows >= 0 {
-            if rows > 0 {
-                log!("{label}: snd0info set ({rows} row(s))");
-            }
-            return true;
-        }
-        last_err = unsafe { CStr::from_ptr(msg.as_ptr()) }.to_string_lossy().into_owned();
+    let rows = {
+        let _guard = APP_DB_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe { km_sqlite_exec1(path.as_ptr(), sql.as_ptr(), arg.as_ptr(), msg.as_mut_ptr(), msg.len()) }
+    };
+    if rows > 0 {
+        log!("{ids}: snd0info set ({rows} row(s))");
+    } else if rows < 0 {
+        let e = unsafe { CStr::from_ptr(msg.as_ptr()) }.to_string_lossy();
+        log!("{ids}: snd0info update in {APP_DB} failed: {e}");
     }
-    log!("{label}: snd0info update in {APP_DB} failed: {last_err}");
-    false
+    rows >= 0
 }
 
 /// SMP update_snd0info (sm_appdb.c): point app.db's snd0info at /user/appmeta/<TID>/snd0.at9 so
 /// the home screen plays the title sound. Only when that file exists; errors are logged only.
 pub fn set_snd0info(title_id: &str) {
-    exec_snd0info_batch(&[title_id], title_id);
+    exec_snd0info(&[title_id]);
 }
 
-/// Checks app.db (and its WAL) mtime/size; if modified since the last sync, spawns one
-/// background pass to restore snd0info for all registered titles in a single connection.
+/// When app.db or its WAL changed (mtime/size) since the last good sync, one background UPDATE
+/// for the registered titles. Installed games are skipped: their row is the system's. A failed
+/// sync keeps the old stamp, so the next pass retries it.
 pub fn sync_snd0info_if_changed(tids: &HashSet<String>) {
-    if tids.is_empty() {
-        return;
-    }
     let stamp = app_db_stamp();
     if *LAST_APP_DB_STAMP.lock().unwrap_or_else(|e| e.into_inner()) == Some(stamp) {
         return;
     }
-    if SND0_SYNCING
-        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-        .is_err()
-    {
+    if SND0_SYNCING.swap(true, Ordering::SeqCst) {
         return;
     }
-    let list: Vec<String> = tids
-        .iter()
-        .filter(|tid| Path::new(APPMETA_BASE).join(tid).join("snd0.at9").is_file())
-        .cloned()
-        .collect();
-    if list.is_empty() {
-        *LAST_APP_DB_STAMP.lock().unwrap_or_else(|e| e.into_inner()) = Some(stamp);
-        SND0_SYNCING.store(false, Ordering::SeqCst);
-        return;
-    }
+    let list: Vec<String> =
+        tids.iter().filter(|t| has_snd0(t) && !crate::installed::is_installed(t)).cloned().collect();
     std::thread::spawn(move || {
         let refs: Vec<&str> = list.iter().map(String::as_str).collect();
-        if exec_snd0info_batch(&refs, "sync") {
+        if exec_snd0info(&refs) {
             *LAST_APP_DB_STAMP.lock().unwrap_or_else(|e| e.into_inner()) = Some(app_db_stamp());
         }
         SND0_SYNCING.store(false, Ordering::SeqCst);
