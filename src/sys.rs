@@ -238,6 +238,13 @@ pub fn notify(msg: &str) {
 /// kstuff answers its KEKCALL_CHECK probe (SMP sm_kstuff_is_loaded, ps5-kstuff's contract):
 /// syscall 0xffffffff00000027 with zero arguments returns 0 with carry clear.
 pub fn kstuff_loaded() -> bool {
+    let (rax, carry) = kstuff_probe();
+    !carry && rax == 0
+}
+
+/// The KEKCALL_CHECK probe's raw answer: (rax, carry flag). Logged when it does not answer: some
+/// kstuff builds run games without answering it (cause unknown), so nothing waits on it.
+pub fn kstuff_probe() -> (u64, bool) {
     let (result, err): (u64, u8);
     // SAFETY: the same register contract as SMP's probe; it reads and writes no memory of ours.
     unsafe {
@@ -246,13 +253,15 @@ pub fn kstuff_loaded() -> bool {
             "setc {err}",
             err = out(reg_byte) err,
             inlateout("rax") 0xffff_ffff_0000_0027u64 => result,
-            in("rdi") 0u64, in("rsi") 0u64, in("rdx") 0u64,
+            in("rdi") 0u64, in("rsi") 0u64,
+            // FreeBSD amd64 returns td_retval[1] in rdx (cpu_set_syscall_retval): clobbered.
+            inout("rdx") 0u64 => _,
             inout("r10") 0u64 => _, inout("r8") 0u64 => _, inout("r9") 0u64 => _,
             out("rcx") _, out("r11") _,
             options(nostack),
         );
     }
-    err == 0 && result == 0
+    (result, err != 0)
 }
 
 /// libSystemService's app launch context (CheatRunner's app_launch_ctx_t).

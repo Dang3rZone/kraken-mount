@@ -9,6 +9,7 @@ use crate::sys;
 use std::collections::{HashMap, HashSet};
 use std::ffi::CString;
 use std::io;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -53,6 +54,53 @@ macro_rules! tlog {
     ($($arg:tt)*) => {
         log!("[launch] {}", format!($($arg)*))
     };
+}
+
+mod nsfs;
+
+/// A fake-signed game started this run while the kstuff probe gave no answer: the probe is not
+/// trusted for the rest of the run (logged once, no kstuff_missing toast).
+static PROBE_WRONG: AtomicBool = AtomicBool::new(false);
+
+/// The launch is kstuff's proof: a fake-signed game of ours exec'd, so kstuff works whatever its
+/// probe says. Logs once per run when the probe does not answer.
+fn kstuff_started(tid: &str) {
+    if !sys::kstuff_loaded() && !PROBE_WRONG.swap(true, Ordering::Relaxed) {
+        let (rax, carry) = sys::kstuff_probe();
+        tlog!("kstuff probe got no answer but {tid} started: this kstuff build does not answer KEKCALL_CHECK (rax={rax:#x}, carry={carry})");
+    }
+}
+
+/// A fake-signed launch ended (`why`) without its game process: kstuff is missing when the probe
+/// does not answer either. Never blocks a mount. ponytail: the toast reads the settings file for
+/// `notify` (the watcher has no State); a game that fails for another reason on a kstuff build that
+/// never answers the probe gets the toast too, unless a game started earlier in this run.
+fn kstuff_no_exec(tid: &str, why: &str) {
+    if sys::kstuff_loaded() {
+        tlog!("{tid} no game process ({why}); kstuff probe answered");
+        return;
+    }
+    let (rax, carry) = sys::kstuff_probe();
+    if PROBE_WRONG.load(Ordering::Relaxed) {
+        tlog!("{tid} no game process ({why}); kstuff probe gives no answer (rax={rax:#x}, carry={carry}), not trusted this run");
+        return;
+    }
+    tlog!("{tid} did not start ({why}): kstuff is not running (probe rax={rax:#x}, carry={carry})");
+    if crate::config::load().notify {
+        sys::notify(&crate::i18n::kstuff_missing(crate::i18n::lang(), tid));
+    }
+}
+
+/// The title's game is fake-signed: folder and pkg titles always; an installed one unless its app.pkg
+/// has a retail header (installed.rs). ponytail: an ext install has no app.pkg and counts as fake-signed.
+fn fake_signed(tid: &str, installed: bool) -> bool {
+    !installed || !crate::cache::stamp_source(tid)
+        .is_some_and(|dir| crate::installed::retail_of(&std::path::Path::new(&dir).join("app.pkg")))
+}
+
+/// A backport redirect of ours (live, or retained after a failed delete) reads from `path`.
+pub fn backport_in_use(path: &std::path::Path) -> bool {
+    nsfs::in_use(path)
 }
 
 fn errno() -> i32 {
@@ -255,6 +303,24 @@ struct Session {
     grace: Option<u64>,
     /// Exits whose crash dump was not there yet: (pid, exit status, now_ms), looked for again at the end.
     exits: Vec<(libc::pid_t, String, u64)>,
+    /// An installed title's redirects (nsfs.rs) still waiting for the sandbox's nsfs /app0; None once
+    /// redirected, skipped or failed, and for every other title.
+    backport: Option<Want>,
+    /// The sandbox whose /app0 holds our backport redirects (nsfs.rs), released at cleanup.
+    redirected: Option<String>,
+    /// now_ms when the session started (the sandbox seen, else the exec): the redirect timing.
+    seen: u64,
+    /// A fake-signed launch whose game has not exec'd yet: its exec, or the sandbox going or
+    /// PENDING_TIMEOUT_MS passing without one, tells whether kstuff runs (kstuff_started/kstuff_no_exec).
+    kstuff: bool,
+}
+
+/// What an installed title's sandbox /app0 gets through nsfs.rs: the backport's loose files, and with
+/// hide_ampr (cache::ng_dropped) the install's own libSceAmpr.sprx redirected to the system's.
+#[derive(Clone)]
+struct Want {
+    backport: Option<String>,
+    hide_ampr: bool,
 }
 
 impl Session {
@@ -265,10 +331,42 @@ impl Session {
         if has_files(&fakelib) {
             srcs.push(fakelib);
         }
+        // Folder and pkg games carry their backport in /app0 already (register.rs unionfs, the cache).
+        let installed = crate::cache::stamp_kind(tid).as_deref() == Some("installed");
+        let backport = installed.then(|| Want { backport: crate::cache::stamp_backport(tid), hide_ampr: crate::cache::ng_dropped(tid) })
+            .filter(|w| w.backport.is_some() || w.hide_ampr);
         Session {
             tid: tid.to_string(), lib: None, srcs, layers: Vec::new(), data: Vec::new(), pid: None, cleanup: None, grace: None,
-            exits: Vec::new(),
+            exits: Vec::new(), backport, redirected: None, seen: now_ms(), kstuff: fake_signed(tid, installed),
         }
+    }
+
+    /// The backport's loose files into an installed title's nsfs /app0 of sandbox `name` (SMP's
+    /// pre-spawn NSFS redirects). `when`: "sandbox" (fast path), "poll" (before exec) or "exec" (the
+    /// last try, after the eboot.bin was loaded). Quiet while /app0 is not nsfs; at exec a skip.
+    fn redirect(&mut self, name: &str, when: &str) {
+        let Some(w) = self.backport.clone() else { return };
+        let r = nsfs::apply(&self.tid, name, w.backport.as_deref().map(std::path::Path::new), w.hide_ampr);
+        let bp = match (&w.backport, w.hide_ampr) {
+            (Some(b), true) => format!("{b} + the install's libSceAmpr.sprx hidden"),
+            (Some(b), false) => b.clone(),
+            (None, _) => "the install's libSceAmpr.sprx hidden (ampr_installed off)".into(),
+        };
+        if nsfs::has(name) {
+            self.redirected = Some(name.to_string());
+        }
+        let ms = now_ms().saturating_sub(self.seen);
+        match r {
+            Ok(nsfs::Applied::NotNsfs) if when != "exec" => return,
+            Ok(nsfs::Applied::NotNsfs) => {
+                tlog!("{} sandbox /app0 not nsfs at exec ({ms} ms after sandbox seen); no backport redirects: {bp}", self.tid)
+            }
+            Ok(nsfs::Applied::Done(n)) => tlog!("{} backport redirects ACTIVE: {n} from {bp} into {SANDBOX_ROOT}/{name}/app0 ({when}, {ms} ms after sandbox seen, {} exec)",
+                self.tid, if when == "exec" { "after" } else { "before" }),
+            Err(e) => tlog!("{} backport redirects FAILED errno={} ({e}) ({when}, {ms} ms after sandbox seen): {bp} -> {SANDBOX_ROOT}/{name}/app0",
+                self.tid, e.raw_os_error().unwrap_or(0)),
+        }
+        self.backport = None;
     }
 
     /// The session's end: the second and last look for the dumps not there at exit.
@@ -355,6 +453,11 @@ impl Session {
         if std::path::Path::new(FONTS).is_dir() {
             self.mount_dir(&format!("{}{FONTS}", root.display()), FONTS, libc::MNT_RDONLY as i32);
         }
+        // An installed title (stamp kind "installed"): /app0 stays the system's (its own install, no
+        // /system_ex/app/<TID> of ours), no /app0/kraken.
+        if crate::cache::stamp_kind(&self.tid).as_deref() == Some("installed") {
+            return;
+        }
         // Writable /app0 (the game's files: the dump folder, or the pkg cache), then the pkg's folder
         // at /app0/kraken (ng finds the .pkg there). Both on top of the system's /app0.
         let app0 = format!("{}/app0", root.display());
@@ -373,7 +476,6 @@ impl Session {
     /// A read-write nullfs of /system_ex/app/<TID> (the registered app0 stack, backport unionfs
     /// included) over the sandbox's /app0, only when the system's one is read-only. Not yet mounted
     /// at the sandbox's first sight: the exec pass (mount_data again) gets it.
-    /// ponytail: not adopted by a later copy of the payload (adopt knows /data, USB and /app0/kraken).
     /// False while the system's /app0 is not mounted (then /app0/kraken must wait too).
     fn mount_app0(&mut self, app0: &str) -> bool {
         let from = format!("/system_ex/app/{}", self.tid);
@@ -457,12 +559,17 @@ impl Session {
     /// path (SMP), by its fsid instead. ENOENT/EINVAL/gone count as done. Returns the errno of
     /// the first layer that stays (EBUSY retries), or None when all are gone.
     fn unmount_pass(&mut self, force: bool) -> Option<i32> {
+        // The backport redirects: deleted only in their own namespace, never forced (nsfs.rs).
+        let busy = self.redirected.as_deref().and_then(nsfs::release);
+        if busy.is_none() {
+            self.redirected = None;
+        }
         let Some(lib) = self.lib.clone() else {
             self.layers.clear();
-            return None;
+            return busy;
         };
         let flags = if force { libc::MNT_FORCE } else { 0 };
-        let mut first_err = self.unmount_data(flags);
+        let mut first_err = self.unmount_data(flags).or(busy);
         while let Some(fsid) = self.layers.pop() {
             let rc = match top_mount(&lib) {
                 Err(e) if matches!(e.raw_os_error(), Some(libc::ENOENT) | Some(libc::ENOTDIR)) => {
@@ -568,10 +675,14 @@ pub fn watch(titles: Arc<Mutex<HashSet<String>>>, running: Arc<Mutex<HashSet<Str
     loop {
         let now = now_ms();
         let mut wait: Option<u64> = (!vnode_ok).then_some(RETRY_MS);
-        if !w.pending.is_empty() {
+        if !w.pending.is_empty() || w.sessions.values().any(|s| s.backport.is_some()) {
             wait = Some(wait.map_or(PENDING_POLL_MS, |x| x.min(PENDING_POLL_MS)));
         }
         for s in w.sessions.values() {
+            if s.kstuff {
+                let d = (s.seen + PENDING_TIMEOUT_MS).saturating_sub(now);
+                wait = Some(wait.map_or(d, |x| x.min(d)));
+            }
             if let Some((_, next)) = s.cleanup {
                 let d = next.saturating_sub(now);
                 wait = Some(wait.map_or(d, |x| x.min(d)));
@@ -584,7 +695,13 @@ pub fn watch(titles: Arc<Mutex<HashSet<String>>>, running: Arc<Mutex<HashSet<Str
             if errno() == libc::EINTR {
                 continue;
             }
-            tlog!("kevent wait failed: {}; launch watcher stopped", io::Error::last_os_error());
+            tlog!("kevent wait failed: {}; launch watcher restarts", io::Error::last_os_error());
+            unsafe {
+                if fd >= 0 {
+                    libc::close(fd);
+                }
+                libc::close(kq);
+            }
             return;
         }
         // The sandbox dir is the earlier signal: handle it before execs from the same batch.
@@ -607,6 +724,8 @@ pub fn watch(titles: Arc<Mutex<HashSet<String>>>, running: Arc<Mutex<HashSet<Str
             }
         }
         w.poll_pending();
+        w.poll_redirects();
+        w.poll_kstuff();
         w.poll_cleanups();
         w.publish();
     }
@@ -627,10 +746,12 @@ impl Watcher {
         }
     }
 
-    /// At start: take over the sandboxes a previous copy left our layers in (it quit or crashed
-    /// mid-game), so their NOTE_EXIT still unmounts them. Any TID: `titles` is empty this early.
+    /// At start and after a watcher restart: take over the sandboxes a previous copy or watcher left
+    /// our layers or sandbox mounts in (it quit, crashed or failed mid-game), so their NOTE_EXIT still
+    /// unmounts them. `titles` already holds the built caches (main fills it before the first watch).
     fn adopt(&mut self) {
         let names: Vec<String> = self.known.iter().cloned().collect();
+        let titles = self.titles();
         let mut all = None;
         for name in names {
             let Some(tid) = sandbox_tid(&name).map(str::to_string) else { continue };
@@ -639,14 +760,18 @@ impl Watcher {
             let ours = our_srcs(&tid);
             let mut s = Session::new(&tid);
             s.srcs.clear();
+            // ponytail: no new redirects after a watcher restart; ones made before it (nsfs.rs keeps
+            // them in a static) are still released. A new payload process knows none: the namespace
+            // releases them at the sandbox teardown.
+            s.backport = None;
+            // Adopted mid-game: its exec is not seen, so no kstuff verdict.
+            s.kstuff = false;
+            s.redirected = nsfs::has(&name).then(|| name.clone());
             for m in all.iter().filter(|m| m.on == lib) {
                 if let Some(src) = ours.iter().find(|x| is_our_overlay(m, x)) {
                     s.layers.push(m.fsid);
                     s.srcs.push(src.clone());
                 }
-            }
-            if s.layers.is_empty() {
-                continue;
             }
             // Ours only: from == the alias itself (ShellCore's own /data is from /user/data).
             let root = format!("{SANDBOX_ROOT}/{name}");
@@ -661,6 +786,15 @@ impl Watcher {
             for m in all.iter().filter(|m| m.on == path && m.fstype == "nullfs" && m.from == FONTS) {
                 s.data.push((path.clone(), m.fsid));
             }
+            // Our writable /app0 (a nullfs of /system_ex/app/<TID>), before /app0/kraken: data is
+            // unmounted last-in first, so /app0/kraken goes before the /app0 under it. Only for a title
+            // of ours that is not installed: an installed one's /app0 can be the system's own rw nullfs.
+            let (path, from) = (format!("{root}/app0"), format!("/system_ex/app/{tid}"));
+            if titles.contains(&tid) && crate::cache::stamp_kind(&tid).as_deref() != Some("installed") {
+                for m in all.iter().filter(|m| m.on == path && m.fstype == "nullfs" && m.from == from && !m.rdonly) {
+                    s.data.push((path.clone(), m.fsid));
+                }
+            }
             let pkg_dir = crate::cache::pkg_source(&tid)
                 .and_then(|p| std::path::Path::new(&p).parent().and_then(|d| d.to_str()).map(str::to_string));
             if let Some(from) = pkg_dir {
@@ -668,6 +802,13 @@ impl Watcher {
                 for m in all.iter().filter(|m| m.on == path && m.fstype == "nullfs" && m.from == from) {
                     s.data.push((path.clone(), m.fsid));
                 }
+            }
+            // No overlay (empty fakelib, or it failed to mount): still ours when it has our sandbox
+            // mounts, which must go at its exit, or when a title of ours runs in it (keeps the scan paused).
+            if s.layers.is_empty() && s.data.is_empty() && s.redirected.is_none()
+                && !(titles.contains(&tid) && find_title_pid(&tid).is_some())
+            {
+                continue;
             }
             s.lib = Some(lib.clone());
             match find_title_pid(&tid) {
@@ -681,10 +822,19 @@ impl Watcher {
                         }
                     }
                 }
-                None if std::path::Path::new(&root).is_dir() => {
+                None if std::path::Path::new(&root).is_dir() && s.data.is_empty() => {
                     // ponytail: the pid lookup may miss a game that is still starting; its layers stay
                     // until the sandbox dir goes (on_sandbox_change). A stale dir keeps the scan paused.
                     tlog!("{tid} adopted {name}: no game process found; keeping until the sandbox goes");
+                }
+                None if std::path::Path::new(&root).is_dir() => {
+                    // The game exited while no watcher ran: our sandbox mounts hang the teardown, so the
+                    // dir never goes. The exit cleanup, after the exit grace (a game still starting gets
+                    // it to show its title id, see poll_cleanups).
+                    tlog!("{tid} adopted {name}: no game process found, {} sandbox mount(s) left; cleaning up", s.data.len());
+                    let now = now_ms();
+                    s.grace = Some(now + EXIT_GRACE_MS);
+                    s.cleanup = Some((now + EXIT_GRACE_MS + CLEANUP_TIMEOUT_MS, now + RETRY_MS));
                 }
                 None => {
                     tlog!("{tid} adopted {name}: sandbox dir gone; cleaning up");
@@ -708,7 +858,11 @@ impl Watcher {
         for name in gone {
             if let Some(s) = self.sessions.get_mut(&name) {
                 tlog!("{} sandbox gone: {name}", s.tid);
+                if std::mem::take(&mut s.kstuff) {
+                    kstuff_no_exec(&s.tid, "sandbox gone without exec");
+                }
                 s.grace = None;
+                s.backport = None;
                 s.cleanup.get_or_insert((now_ms() + CLEANUP_TIMEOUT_MS, 0));
             }
         }
@@ -732,16 +886,18 @@ impl Watcher {
             old.unmount_pass(false);
         }
         let mut s = Session::new(tid);
-        if s.srcs.is_empty() {
-            // Still a session: `running` must hold the title while its game runs.
+        // Still a session without an overlay: `running` must hold the title while its game runs.
+        let mut lib_done = s.srcs.is_empty();
+        if lib_done {
             tlog!("{tid} empty fakelib, nothing to overlay; not mounting");
-            self.sessions.insert(name.to_string(), s);
-            return;
         }
         let root = format!("{SANDBOX_ROOT}/{name}");
         loop {
             let waited = now_ms() - t0;
-            if let Some(lib) = s.lib.clone().or_else(|| find_lib(name)) {
+            // An installed title's backport: as soon as /app0 is nsfs, before the eboot.bin loads.
+            s.redirect(name, "sandbox");
+            if lib_done {
+            } else if let Some(lib) = s.lib.clone().or_else(|| find_lib(name)) {
                 s.lib = Some(lib.clone());
                 if let Ok(t) = top_mount(&lib) {
                     if t.on == lib {
@@ -760,17 +916,34 @@ impl Watcher {
                                 s.mount(0, "sandbox");
                             }
                         }
-                        break;
+                        lib_done = true;
                     }
                 }
             }
+            if lib_done && s.backport.is_none() {
+                break;
+            }
             if waited >= READY_WAIT_MS {
-                tlog!("{tid} common/lib not a mount point after {waited} ms (lib={:?}); waiting for exec", s.lib);
+                if !lib_done {
+                    tlog!("{tid} common/lib not a mount point after {waited} ms (lib={:?}); waiting for exec", s.lib);
+                }
+                if s.backport.is_some() {
+                    tlog!("{tid} sandbox /app0 not nsfs after {waited} ms; backport redirects polled until exec");
+                }
                 break;
             }
             if !is_dir(&root) {
                 tlog!("{tid} sandbox vanished while waiting: {root}");
-                return;
+                if std::mem::take(&mut s.kstuff) {
+                    kstuff_no_exec(tid, "sandbox vanished before exec");
+                }
+                if s.layers.is_empty() && s.data.is_empty() && s.redirected.is_none() {
+                    return;
+                }
+                // Something of ours is in it already: the cleanup takes it.
+                s.backport = None;
+                s.cleanup = Some((now_ms() + CLEANUP_TIMEOUT_MS, 0));
+                break;
             }
             std::thread::sleep(Duration::from_millis(1));
         }
@@ -813,6 +986,29 @@ impl Watcher {
         }
     }
 
+    /// Backport redirects still waiting for an nsfs /app0: tried every PENDING_POLL_MS until the exec
+    /// pass, given up PENDING_TIMEOUT_MS after the sandbox was seen (no exec: a failed launch).
+    fn poll_redirects(&mut self) {
+        let now = now_ms();
+        for (name, s) in self.sessions.iter_mut().filter(|(_, s)| s.backport.is_some()) {
+            if now.saturating_sub(s.seen) >= PENDING_TIMEOUT_MS {
+                tlog!("{} no nsfs /app0 and no exec {PENDING_TIMEOUT_MS} ms after sandbox seen; no backport redirects: {name}", s.tid);
+                s.backport = None;
+                continue;
+            }
+            s.redirect(name, "poll");
+        }
+    }
+
+    /// Fake-signed launches with no exec PENDING_TIMEOUT_MS after the session started: kstuff_no_exec.
+    fn poll_kstuff(&mut self) {
+        let now = now_ms();
+        for s in self.sessions.values_mut().filter(|s| s.kstuff && now.saturating_sub(s.seen) >= PENDING_TIMEOUT_MS) {
+            s.kstuff = false;
+            kstuff_no_exec(&s.tid, &format!("no exec {PENDING_TIMEOUT_MS} ms after sandbox seen"));
+        }
+    }
+
     /// Strategy 2 (SMP sm_fakelib_game_on_exec): an exec of one of our titles. Mounts the overlay
     /// if it is not on top of common/lib yet, and watches the pid for NOTE_EXIT.
     fn attach(&mut self, pid: libc::pid_t, tid: &str) {
@@ -827,6 +1023,11 @@ impl Watcher {
             },
         };
         let s = self.sessions.entry(name.clone()).or_insert_with(|| Session::new(tid));
+        if std::mem::take(&mut s.kstuff) {
+            kstuff_started(tid);
+        }
+        // The last chance for the backport redirects: the eboot.bin is loaded by now (logged).
+        s.redirect(&name, "exec");
         if s.lib.is_none() {
             s.lib = find_lib(&name);
         }
@@ -866,6 +1067,11 @@ impl Watcher {
             let k = kev(pid as usize, libc::EVFILT_PROC, libc::EV_ADD | libc::EV_ENABLE | libc::EV_CLEAR, libc::NOTE_EXIT as u32);
             if let Err(e) = kevent_add(self.kq, k) {
                 tlog!("{tid} exit watch pid={pid} failed: {e}");
+                // Gone before the watch (ESRCH, e.g. an adopted-grace pid): no NOTE_EXIT will come.
+                if !alive(pid) {
+                    tlog!("{tid} pid={pid} already exited; cleaning up: {name}");
+                    s.cleanup = Some((now_ms() + CLEANUP_TIMEOUT_MS, 0));
+                }
             }
         }
     }
@@ -899,12 +1105,22 @@ impl Watcher {
     fn poll_cleanups(&mut self) {
         let now = now_ms();
         let mut done = Vec::new();
+        let mut started = Vec::new();
         for (name, s) in self.sessions.iter_mut() {
             let Some((mut deadline, next)) = s.cleanup else { continue };
             if now < next {
                 continue;
             }
             if let Some(end) = s.grace {
+                // An adopted session with no pid: a game still starting gets the grace to show up
+                // (attach cancels the cleanup). ponytail: one that takes longer loses its sandbox mounts.
+                if s.pid.is_none() && now < end {
+                    if let Some(pid) = find_title_pid(&s.tid) {
+                        started.push((pid, s.tid.clone()));
+                    }
+                    s.cleanup = Some((deadline, now + RETRY_MS));
+                    continue;
+                }
                 // A real exit: ShellCore's teardown takes common/lib and our overlay with it. A spawn keeps it.
                 if now < end && s.top_layer().is_some() {
                     s.cleanup = Some((deadline, now + RETRY_MS));
@@ -937,6 +1153,10 @@ impl Watcher {
                     done.push(name.clone());
                 }
             }
+        }
+        for (pid, tid) in started {
+            tlog!("{tid} adopted session: game pid={pid} found; watching it");
+            self.attach(pid, &tid);
         }
         for name in done {
             if let Some(s) = self.sessions.remove(&name) {

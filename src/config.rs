@@ -10,6 +10,10 @@ pub struct Settings {
     /// Absolute paths whose sources (the path itself or anything under it) the scan skips.
     pub exclude: Vec<String>,
     pub inject_ampr: bool,
+    /// Installed games (Kind::Installed) get /data/krakenmount/ampr/* in their fakelib.
+    pub ampr_installed: bool,
+    /// Delete the source .pkg after the console reports its install done (install.rs).
+    pub install_delete_source: bool,
     pub add_emulators: bool,
     /// Title ids that get no bundled PlayGo stub (pgo_stub): not added, not upgraded.
     pub playgo_off: Vec<String>,
@@ -28,7 +32,17 @@ pub struct Settings {
     /// Write /data/krakenmount/kraken.log (the payload's stdout always gets the lines).
     pub log: bool,
     pub debug: bool,
+    pub ui_theme: String,
+    pub ui_scheme: String,
+    pub ui_sidebar_collapsed: bool,
+    /// "" = the browser's language.
+    pub ui_lang: String,
 }
+
+pub const UI_THEMES: &[&str] = &["dark", "light"];
+pub const UI_SCHEMES: &[&str] = &["abyss", "ember", "moss"];
+/// The LANGS table in ui.html.
+pub const UI_LANGS: &[&str] = &["en", "ru", "zh", "de", "es", "fr", "ja", "pt", "it", "ko", "ar"];
 
 impl Default for Settings {
     fn default() -> Self {
@@ -36,6 +50,8 @@ impl Default for Settings {
             scan_paths: Vec::new(),
             exclude: Vec::new(),
             inject_ampr: true,
+            ampr_installed: false,
+            install_delete_source: false,
             add_emulators: true,
             playgo_off: Vec::new(),
             overlay_off: Vec::new(),
@@ -49,6 +65,10 @@ impl Default for Settings {
             notify: true,
             log: true,
             debug: false,
+            ui_theme: "dark".into(),
+            ui_scheme: "abyss".into(),
+            ui_sidebar_collapsed: false,
+            ui_lang: String::new(),
         }
     }
 }
@@ -58,9 +78,11 @@ const HELP: &[(&str, &str)] = &[
     ("scanpath", "replaces the default scan roots (/data/homebrew, /data/etaHEN/games, <drive>/homebrew, ...)"),
     ("exclude", "absolute paths the scan skips: a source at one of them or under it is not listed or registered (a registered title stays registered)"),
     ("inject_ampr", "true = copy /data/krakenmount/ampr/* on top of a folder game's fakelib (pkg games always get it; a change only refreshes fakelib/)"),
+    ("ampr_installed", "true = copy /data/krakenmount/ampr/* on top of an installed game's fakelib (a change only refreshes fakelib/)"),
+    ("install_delete_source", "true = delete the source .pkg once the console reports its install done (Install tab)"),
     ("add_emulators", "true = add the bundled DLC (dlc_emu) and PlayGo (pgo_stub) emulators to a game's fakelib when it needs them and ships none (a change only refreshes fakelib/)"),
     ("playgo_off", "title ids that get no bundled PlayGo stub (pgo_stub): not added, not upgraded; a libScePlayGo.sprx the game ships stays (a change only refreshes fakelib/)"),
-    ("overlay_off", "title ids (folder games) that get no fakelib overlay at launch: not the game's fakelib/, not ampr-emu-ng, not the emulators (a change only refreshes fakelib/)"),
+    ("overlay_off", "title ids (folder and installed games; a pkg game keeps its overlay) that get no fakelib overlay at launch: not the game's fakelib/, not ampr-emu-ng, not the emulators (a change only refreshes fakelib/)"),
     ("ampr_auto_update", "true = once per start, download a newer ampr-emu-ng release from GitHub (a hand-placed libSceAmpr.sprx is kept)"),
     ("backports", "true = apply backports/<TID>* from the game's scan root, then the other roots, then /data/homebrew"),
     ("scan_interval_seconds", "scan loop period, 1..3600"),
@@ -71,6 +93,10 @@ const HELP: &[(&str, &str)] = &[
     ("notify", "true = system toasts"),
     ("log", "true = write /data/krakenmount/kraken.log (starts over past 1 MiB)"),
     ("debug", "true = klog capture to /data/krakenmount/klog.txt and the /file/data/... route"),
+    ("ui_theme", "web UI theme: \"dark\" or \"light\""),
+    ("ui_scheme", "web UI color scheme: \"abyss\", \"ember\" or \"moss\""),
+    ("ui_sidebar_collapsed", "true = the web UI sidebar shows icons only"),
+    ("ui_lang", "web UI language: \"\" = the browser's, or en, ru, zh, de, es, fr, ja, pt, it, ko, ar"),
 ];
 
 fn flag(v: &str) -> Result<bool, String> {
@@ -78,6 +104,14 @@ fn flag(v: &str) -> Result<bool, String> {
         "1" | "true" => Ok(true),
         "0" | "false" => Ok(false),
         _ => Err(format!("expected 0 or 1, got {v:?}")),
+    }
+}
+
+fn one_of(v: &str, allowed: &[&str]) -> Result<String, String> {
+    if allowed.contains(&v) {
+        Ok(v.to_string())
+    } else {
+        Err(format!("expected one of {}, got {v:?}", allowed.join(", ")))
     }
 }
 
@@ -106,6 +140,8 @@ fn set(s: &mut Settings, key: &str, v: &str) -> Result<(), String> {
         }
         "exclude" => return Err(format!("expected an absolute path without control characters, got {v:?}")),
         "inject_ampr" => s.inject_ampr = flag(v)?,
+        "ampr_installed" => s.ampr_installed = flag(v)?,
+        "install_delete_source" => s.install_delete_source = flag(v)?,
         "add_emulators" => s.add_emulators = flag(v)?,
         "playgo_off" if crate::scan::valid_tid(v) => {
             if !s.playgo_off.iter().any(|t| t == v) {
@@ -140,6 +176,11 @@ fn set(s: &mut Settings, key: &str, v: &str) -> Result<(), String> {
         "notify" => s.notify = flag(v)?,
         "log" => s.log = flag(v)?,
         "debug" => s.debug = flag(v)?,
+        "ui_theme" => s.ui_theme = one_of(v, UI_THEMES)?,
+        "ui_scheme" => s.ui_scheme = one_of(v, UI_SCHEMES)?,
+        "ui_sidebar_collapsed" => s.ui_sidebar_collapsed = flag(v)?,
+        "ui_lang" if v.is_empty() => s.ui_lang.clear(),
+        "ui_lang" => s.ui_lang = one_of(v, UI_LANGS)?,
         _ => return Err("unknown key".into()),
     }
     Ok(())
@@ -306,6 +347,8 @@ fn render(s: &Settings) -> String {
                 out += &format!("exclude = [{}]\n", items.join(", "));
             }
             "inject_ampr" => out += &format!("{k} = {}\n", s.inject_ampr),
+            "ampr_installed" => out += &format!("{k} = {}\n", s.ampr_installed),
+            "install_delete_source" => out += &format!("{k} = {}\n", s.install_delete_source),
             "add_emulators" => out += &format!("{k} = {}\n", s.add_emulators),
             "playgo_off" => {
                 let items: Vec<String> = s.playgo_off.iter().map(|t| toml_quote(t)).collect();
@@ -324,6 +367,10 @@ fn render(s: &Settings) -> String {
             "auto_remove_delay_seconds" => out += &format!("{k} = {}\n", s.auto_remove_delay_secs),
             "notify" => out += &format!("{k} = {}\n", s.notify),
             "log" => out += &format!("{k} = {}\n", s.log),
+            "ui_theme" => out += &format!("{k} = {}\n", toml_quote(&s.ui_theme)),
+            "ui_scheme" => out += &format!("{k} = {}\n", toml_quote(&s.ui_scheme)),
+            "ui_sidebar_collapsed" => out += &format!("{k} = {}\n", s.ui_sidebar_collapsed),
+            "ui_lang" => out += &format!("{k} = {}\n", toml_quote(&s.ui_lang)),
             _ => out += &format!("{k} = {}\n", s.debug),
         }
     }
@@ -332,20 +379,36 @@ fn render(s: &Settings) -> String {
 
 /// Reads the config; creates it with the defaults when missing.
 pub fn load() -> Settings {
-    match std::fs::read_to_string(CONFIG_PATH) {
-        Ok(t) => parse(&t),
+    try_load().unwrap_or_else(|e| {
+        log!("config {CONFIG_PATH}: cannot read: {e}; using the defaults");
+        Settings::default()
+    })
+}
+
+/// As `load`, but a read error is returned: a save built on the defaults would overwrite the file.
+/// Invalid UTF-8 is read lossily (an editor's Latin-1 must not reset every setting).
+pub fn try_load() -> std::io::Result<Settings> {
+    match std::fs::read(CONFIG_PATH) {
+        Ok(b) => Ok(parse(&String::from_utf8_lossy(&b))),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             let s = Settings::default();
             if let Err(e) = save(&s) {
                 log!("config {CONFIG_PATH}: cannot create: {e}");
             }
-            s
+            Ok(s)
         }
-        Err(e) => {
-            log!("config {CONFIG_PATH}: cannot read: {e}; using the defaults");
-            Settings::default()
-        }
+        Err(e) => Err(e),
     }
+}
+
+/// Whether `a` and `b` differ only in the web UI's own keys (no rescan needed).
+pub fn ui_only_change(a: &Settings, b: &Settings) -> bool {
+    let mut b = b.clone();
+    b.ui_theme.clone_from(&a.ui_theme);
+    b.ui_scheme.clone_from(&a.ui_scheme);
+    b.ui_sidebar_collapsed = a.ui_sidebar_collapsed;
+    b.ui_lang.clone_from(&a.ui_lang);
+    *a == b
 }
 
 /// Writes the config atomically (tmp + rename).
@@ -364,6 +427,8 @@ pub fn to_json(s: &Settings) -> Value {
         "scanpath": s.scan_paths,
         "exclude": s.exclude,
         "inject_ampr": s.inject_ampr,
+        "ampr_installed": s.ampr_installed,
+        "install_delete_source": s.install_delete_source,
         "add_emulators": s.add_emulators,
         "playgo_off": s.playgo_off,
         "overlay_off": s.overlay_off,
@@ -377,6 +442,10 @@ pub fn to_json(s: &Settings) -> Value {
         "notify": s.notify,
         "log": s.log,
         "debug": s.debug,
+        "ui_theme": s.ui_theme,
+        "ui_scheme": s.ui_scheme,
+        "ui_sidebar_collapsed": s.ui_sidebar_collapsed,
+        "ui_lang": s.ui_lang,
     })
 }
 

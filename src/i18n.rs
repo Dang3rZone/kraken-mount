@@ -277,20 +277,21 @@ pub fn deleted(l: Lang, name: &str) -> String {
     }
 }
 
-/// kstuff does not answer its readiness probe: start-up waits for it (SMP SM_L10N_KSTUFF_WAITING).
-pub fn kstuff_waiting(l: Lang) -> &'static str {
+/// A fake-signed title's sandbox went (or timed out) without its game process and the kstuff probe
+/// does not answer (launch.rs).
+pub fn kstuff_missing(l: Lang, tid: &str) -> String {
     match l {
-        Lang::En => "Kraken Mount: kstuff not found; waiting for it to start",
-        Lang::Ru => "Kraken Mount: kstuff не найден; ожидание его запуска",
-        Lang::Zh => "Kraken Mount：未找到 kstuff，正在等待其启动",
-        Lang::De => "Kraken Mount: kstuff nicht gefunden; warte auf den Start",
-        Lang::Es => "Kraken Mount: no se encontró kstuff; esperando a que se inicie",
-        Lang::Fr => "Kraken Mount : kstuff introuvable ; en attente de son démarrage",
-        Lang::Ja => "Kraken Mount: kstuff が見つかりません。起動を待っています",
-        Lang::Pt => "Kraken Mount: kstuff não encontrado; aguardando sua inicialização",
-        Lang::It => "Kraken Mount: kstuff non trovato; in attesa del suo avvio",
-        Lang::Ko => "Kraken Mount: kstuff를 찾을 수 없습니다. 시작될 때까지 기다리는 중입니다",
-        Lang::Ar => "Kraken Mount: لم يتم العثور على kstuff؛ جارٍ انتظار تشغيله",
+        Lang::En => format!("Kraken Mount: {tid} did not start: kstuff is not running"),
+        Lang::Ru => format!("Kraken Mount: {tid} не запустилась: kstuff не запущен"),
+        Lang::Zh => format!("Kraken Mount：{tid} 未能启动：kstuff 未运行"),
+        Lang::De => format!("Kraken Mount: {tid} ist nicht gestartet: kstuff läuft nicht"),
+        Lang::Es => format!("Kraken Mount: {tid} no se inició: kstuff no se está ejecutando"),
+        Lang::Fr => format!("Kraken Mount : {tid} n'a pas démarré : kstuff n'est pas lancé"),
+        Lang::Ja => format!("Kraken Mount: {tid} を起動できませんでした: kstuff が実行されていません"),
+        Lang::Pt => format!("Kraken Mount: {tid} não iniciou: o kstuff não está em execução"),
+        Lang::It => format!("Kraken Mount: {tid} non si è avviato: kstuff non è in esecuzione"),
+        Lang::Ko => format!("Kraken Mount: {tid}이(가) 시작되지 않았습니다: kstuff가 실행 중이 아닙니다"),
+        Lang::Ar => format!("Kraken Mount: لم يبدأ {tid}: kstuff لا يعمل"),
     }
 }
 

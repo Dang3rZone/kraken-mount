@@ -1,4 +1,6 @@
 //! Per-game cache /data/krakenmount/caches/<TID> (DESIGN.md "Cache"). Folder: fakelib/ only.
+//! Installed (the console's own install): fakelib/ only, from the backport's lib dir, the emulators
+//! and the ampr files (ampr_installed); never registered or mounted by us.
 //! FPKG: the cache is /app0: sce_sys, eboot.bin and every PRX and ELF extracted, fakelib/, kraken/ (launch.rs
 //! mounts the pkg's folder there), the two AMPR indexes; `.done` (JSON stamp, mtime = build start) last.
 //! fakelib/ (both kinds) = the game's or backport's libs, then /data/krakenmount/ampr/* copied on
@@ -104,17 +106,21 @@ fn open(pkg: &Path) -> Result<(Io, Pkg)> {
 pub fn peek_pkg(pkg: &Path) -> Result<(String, String, String)> {
     let (io, p) = open(pkg)?;
     let param = p.lookup("sce_sys/param.json").ok_or_else(|| bad("no sce_sys/param.json".into()))?;
-    crate::scan::parse_param(&read_all(&p, &io, &param)?)
+    crate::scan::parse_param(&read_all(&p, &io, &param, 1 << 20)?)
 }
 
 /// One file of the pkg, e.g. "sce_sys/icon0.png" (images of a pkg whose cache is not built).
 pub fn pkg_file(pkg: &Path, name: &str) -> Result<Vec<u8>> {
     let (io, p) = open(pkg)?;
     let e = p.lookup(name).ok_or_else(|| Error::new(ErrorKind::NotFound, format!("{}: no {name}", pkg.display())))?;
-    read_all(&p, &io, &e)
+    read_all(&p, &io, &e, 32 << 20)
 }
 
-fn read_all<R: PRead>(p: &Pkg, io: &R, e: &Entry) -> Result<Vec<u8>> {
+/// A corrupt entry size must not abort the payload (panic=abort) on every scan of that pkg.
+fn read_all<R: PRead>(p: &Pkg, io: &R, e: &Entry, max: u64) -> Result<Vec<u8>> {
+    if e.size > max {
+        return Err(bad(format!("{}: {} bytes, over the {max} byte limit", e.path, e.size)));
+    }
     let mut buf = vec![0u8; e.size as usize];
     let n = p.read_at(io, e, 0, &mut buf).map_err(vfs)?;
     buf.truncate(n);
@@ -191,14 +197,29 @@ fn empty_dir(dir: &Path) -> Result<()> {
 /// Removes what the last build listed in `.built`, keeping files the game wrote; a dir goes only
 /// when it ends up empty. A cache without `.built` (an older build) is emptied.
 fn clear_build(dir: &Path) -> Result<()> {
-    let Ok(list) = fs::read_to_string(dir.join(BUILT)) else { return empty_dir(dir) };
+    // `.done` first: a clear cut off midway must not leave a half-cleared cache that check() calls fresh.
+    match fs::remove_file(dir.join(DONE)) {
+        Err(e) if e.kind() != ErrorKind::NotFound => return Err(e),
+        _ => {}
+    }
+    // Only a missing `.built` means an older build; a read error must not empty the game's files.
+    let list = match fs::read(dir.join(BUILT)) {
+        Ok(b) => String::from_utf8_lossy(&b).into_owned(),
+        Err(e) if e.kind() == ErrorKind::NotFound => {
+            empty_dir(dir)?;
+            return fs::write(dir.join(BUILT), "");
+        }
+        Err(e) => return Err(e),
+    };
     // Recomposed after the build too (refresh_fakelib), so .built may not list all of it: always ours.
     match fs::remove_dir_all(dir.join("fakelib")) {
         Err(e) if e.kind() != ErrorKind::NotFound => return Err(e),
         _ => {}
     }
     let mut dirs = Vec::new();
-    for rel in list.lines().filter(|l| !l.is_empty()) {
+    // AMPR_STATE stays: compose_fakelib reads its playgo memo and the unmounted emus fallback, and
+    // rewrites it.
+    for rel in list.lines().filter(|l| !l.is_empty() && *l != AMPR_STATE) {
         // Our own file, but never step outside the cache.
         if Path::new(rel).components().any(|c| !matches!(c, std::path::Component::Normal(_))) {
             continue;
@@ -214,13 +235,10 @@ fn clear_build(dir: &Path) -> Result<()> {
     for d in dirs {
         let _ = fs::remove_dir(&d); // fails while it still holds game files: kept
     }
-    for name in [BUILT, DONE] {
-        match fs::remove_file(dir.join(name)) {
-            Err(e) if e.kind() != ErrorKind::NotFound => return Err(e),
-            _ => {}
-        }
-    }
-    Ok(())
+    // Emptied, not removed: a build that fails or is cut off must not leave a cache without `.built`,
+    // which the next build would empty (game-written files included).
+    // ponytail: files a cut-off build wrote stay unlisted (kept like game files) until Purge.
+    fs::write(dir.join(BUILT), "")
 }
 
 /// Paths under `dir` that were not there before the build (`before`), deepest dirs last.
@@ -250,12 +268,18 @@ pub fn dir(tid: &str) -> PathBuf {
     Path::new(CACHES).join(tid)
 }
 
+/// Where the game's /app0 files are. Installed: the system's own /system_ex/app/<TID> (read-only
+/// here, used for the eboot.bin and dlc_emu.ini lookups; it may not be mounted outside a launch).
 pub fn app0(src: &Source) -> PathBuf {
     match src.kind {
         Kind::Pkg => dir(&src.title_id),
         Kind::Folder(_) => src.path.clone(),
+        Kind::Installed => Path::new(SYSTEM_APP).join(&src.title_id),
     }
 }
+
+/// Where the system mounts a title's /app0.
+const SYSTEM_APP: &str = "/system_ex/app";
 
 pub fn sce_sys(src: &Source) -> PathBuf {
     app0(src).join("sce_sys")
@@ -289,7 +313,14 @@ pub fn purge(keep: &[String]) -> Result<()> {
         let name = e.file_name().to_string_lossy().into_owned();
         let r = if !keep.contains(&name) {
             // A pkg cache is app0: drop its /system_ex/app stack first, or it keeps the deleted inode.
-            if let Err(err) = crate::register::unmount_title(&name) {
+            // Never for an installed title: that stack is the system's (an installed title can miss
+            // from `keep`, e.g. one installed::list skips). ponytail: a layer of ours left over it
+            // is dropped by main's drop_old_mount once the title is listed again.
+            let installed = crate::installed::copy_in(Path::new("/"), &name).is_some()
+                || stamp_kind(&name).as_deref() == Some("installed");
+            if installed {
+                log!("{name}: purge: installed, /system_ex/app/{name} left mounted; deleting {}", path.display());
+            } else if let Err(err) = crate::register::unmount_title(&name) {
                 log!("{name}: purge skipped {}: unmount: {err}", path.display());
                 continue;
             }
@@ -369,6 +400,8 @@ pub fn fix_access(src: &Source) {
             }
         }
         Kind::Folder(_) => a.tree(&src.path, 0o555, 0o444),
+        // The system's install: never chmod'ed from here.
+        Kind::Installed => {}
     }
     if a.fixed + a.failed == 0 {
         return;
@@ -388,7 +421,8 @@ fn bp_lib(src: &Source) -> Option<PathBuf> {
 /// a folder game's fakelib2/fakelib. None for a pkg without one (its libs are inside the pkg).
 fn lib_dir(src: &Source) -> Option<PathBuf> {
     bp_lib(src).or_else(|| match src.kind {
-        Kind::Pkg => None,
+        // Installed: only a backport's lib dir (the install's own libs are already in /app0).
+        Kind::Pkg | Kind::Installed => None,
         Kind::Folder(_) => ["fakelib2", "fakelib"].iter().map(|d| src.path.join(d)).find(|p| p.is_dir()),
     })
 }
@@ -401,13 +435,49 @@ const STAMP_V: u64 = 3;
 pub fn stamp(src: &Source, _s: &Settings) -> serde_json::Value {
     serde_json::json!({
         "v": STAMP_V,
-        "kind": if src.kind == Kind::Pkg { "pkg" } else { "folder" },
+        "kind": kind_name(src.kind),
         "source": src.path.to_string_lossy(),
         "size": src.size,
         "backport": src.backport.as_ref().map(|b| b.to_string_lossy()),
         // Which lib dir was used: a removed or newly added fakelib/fakelib2 changes it.
         "fakelib": lib_dir(src).map(|p| p.to_string_lossy().into_owned()),
     })
+}
+
+/// The stamp's "kind".
+fn kind_name(kind: Kind) -> &'static str {
+    match kind {
+        Kind::Pkg => "pkg",
+        Kind::Folder(_) => "folder",
+        Kind::Installed => "installed",
+    }
+}
+
+/// The `.done` stamp's "source" of title `tid` (the pkg, folder or install dir); None without a cache.
+pub fn stamp_source(tid: &str) -> Option<String> {
+    let stamp: serde_json::Value = serde_json::from_slice(&fs::read(dir(tid).join(DONE)).ok()?).ok()?;
+    Some(stamp["source"].as_str()?.to_string())
+}
+
+/// The `.done` stamp's "kind" of title `tid` ("pkg", "folder", "installed"); None without a cache.
+pub fn stamp_kind(tid: &str) -> Option<String> {
+    let stamp: serde_json::Value = serde_json::from_slice(&fs::read(dir(tid).join(DONE)).ok()?).ok()?;
+    Some(stamp["kind"].as_str()?.to_string())
+}
+
+/// The title's fakelib was composed with drops_game_ng (an installed game, ampr_installed off): launch
+/// then also hides the install's own libSceAmpr.sprx in /app0 (launch/nsfs.rs).
+pub fn ng_dropped(tid: &str) -> bool {
+    fs::read(dir(tid).join(AMPR_STATE)).ok()
+        .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+        .is_some_and(|v| v["ampr"] == "drop")
+}
+
+/// The `.done` stamp's "backport" of title `tid` (the backport dir the cache was built with); None
+/// without a cache or a backport (the `backports` setting off leaves it out).
+pub fn stamp_backport(tid: &str) -> Option<String> {
+    let stamp: serde_json::Value = serde_json::from_slice(&fs::read(dir(tid).join(DONE)).ok()?).ok()?;
+    Some(stamp["backport"].as_str()?.to_string())
 }
 
 /// Existing paths whose mtime must be older than `.done`. The ampr dir is not one: launch mounts it.
@@ -424,6 +494,17 @@ pub fn inputs(src: &Source, _s: &Settings) -> Vec<PathBuf> {
         }
         // ponytail: only the lib dir of a folder's backport feeds its cache; the rest is a live unionfs.
         // Not the game folder itself: the game writes there (/app0 is writable), which must not rebuild.
+        // The install itself (app.pkg; an ext copy's dir when it has none) and the backport's lib dir.
+        // ponytail: not /system_ex/app/<TID> (mounted by the system, maybe not now); a patch
+        // installed over it changes the eboot only, seen through emu_state.
+        Kind::Installed => {
+            let pkg = src.path.join("app.pkg");
+            v.push(if pkg.exists() { pkg } else { src.path.clone() });
+            if let Some(lib) = bp_lib(src) {
+                v.extend(walk(&lib).into_iter().map(|e| e.0));
+                v.push(lib);
+            }
+        }
         Kind::Folder(_) => {
             v.extend([src.path.join("eboot.bin"), src.path.join("sce_sys/param.json")]);
             v.retain(|p| p.exists());
@@ -485,6 +566,9 @@ fn folder_id(src: &Source, s: &Settings) -> String {
     let mut v = Vec::new();
     let mut feed = |b: &[u8]| v.extend_from_slice(b);
     let eboot = src.path.join("eboot.bin");
+    // ponytail: an installed app.pkg (many GB) feeds its size and mtime, not its bytes; an install
+    // over it rewrites the file, so the mtime changes.
+    let app_pkg = (src.kind == Kind::Installed).then(|| src.path.join("app.pkg"));
     let mut files = inputs(src, s);
     files.sort();
     for p in files {
@@ -492,7 +576,9 @@ fn folder_id(src: &Source, s: &Settings) -> String {
         if m.is_file() {
             feed(p.strip_prefix(&src.path).unwrap_or(&p).to_string_lossy().as_bytes());
             feed(&m.len().to_le_bytes());
-            if p != eboot {
+            if app_pkg.as_ref() == Some(&p) {
+                feed(&std::os::unix::fs::MetadataExt::mtime(&m).to_le_bytes());
+            } else if p != eboot {
                 feed(&fs::read(&p).unwrap_or_default());
             }
         }
@@ -543,6 +629,10 @@ fn same_files(src: &Source, s: &Settings, old: &serde_json::Value, done_mtime: S
 /// The ampr files fakelib/ should carry: {name: [size, mtime]} of /data/krakenmount/ampr's
 /// regular files (libkernel.sprx never copied), or null when `injects_ampr` is false.
 fn ampr_state(src: &Source, s: &Settings) -> serde_json::Value {
+    if drops_game_ng(src, s) {
+        // Not null: a cache composed before the drop existed refreshes once.
+        return "drop".into();
+    }
     if !injects_ampr(src, s) {
         return serde_json::Value::Null;
     }
@@ -557,11 +647,21 @@ fn ampr_state(src: &Source, s: &Settings) -> serde_json::Value {
     serde_json::Value::Object(m)
 }
 
-/// Whether fakelib/ gets the ampr dir's files: with inject_ampr, and always for a pkg (#73):
-/// pkg mode exists only in ampr-emu-ng, the package's own libSceAmpr.sprx cannot read the .pkg
-/// named in kraken.image.
+/// Whether fakelib/ gets the ampr dir's files: always for a pkg (#73: pkg mode exists only in
+/// ampr-emu-ng, the package's own libSceAmpr.sprx cannot read the .pkg named in kraken.image);
+/// a folder with inject_ampr; an installed game with ampr_installed.
 fn injects_ampr(src: &Source, s: &Settings) -> bool {
-    s.inject_ampr || src.kind == Kind::Pkg
+    match src.kind {
+        Kind::Pkg => true,
+        Kind::Folder(_) => s.inject_ampr,
+        Kind::Installed => s.ampr_installed,
+    }
+}
+
+/// An installed game without ampr_installed: no libSceAmpr.sprx in its fakelib at all, the backport's
+/// included (SMP removes it from an installed PPR package's backport fakelib), so the system's runs.
+fn drops_game_ng(src: &Source, s: &Settings) -> bool {
+    src.kind == Kind::Installed && !s.ampr_installed
 }
 
 /// libkernel.sprx from the ampr dir would replace the system one for every game: never copied.
@@ -649,22 +749,34 @@ fn keep_game_ng(tid: &str, fakelib: &Path) -> bool {
     keep
 }
 
-/// dlc_emu.ini at a folder game's root or the backport's root (a pkg's own is checked in compose_fakelib).
+/// dlc_emu.ini at a folder game's root, an installed game's /system_ex/app/<TID> or the backport's
+/// root (a pkg's own is checked in compose_fakelib).
 /// Exact name: dlc_emu opens /app0/dlc_emu.ini, and the internal SSD is case-sensitive.
 fn dlc_ini_on_disk(src: &Source) -> bool {
-    (matches!(src.kind, Kind::Folder(_)) && src.path.join(DLC_INI).is_file())
+    (src.kind != Kind::Pkg && app0(src).join(DLC_INI).is_file())
         || src.backport.as_ref().is_some_and(|b| b.join(DLC_INI).is_file())
 }
 
 /// The eboot.bin searched for a PlayGo import: the backport's if it has one, else the folder's,
-/// else (pkg) the cache's extracted copy.
-fn eboot(src: &Source) -> PathBuf {
+/// else (pkg) the cache's extracted copy, else (installed) /system_ex/app/<TID>/eboot.bin when it
+/// is a file now. None (installed, not mounted or unreadable): the PlayGo import is unknown.
+fn eboot(src: &Source) -> Option<PathBuf> {
+    eboot_in(src, Path::new(SYSTEM_APP))
+}
+
+fn eboot_in(src: &Source, system_app: &Path) -> Option<PathBuf> {
     match &src.backport {
-        Some(b) if b.join("eboot.bin").is_file() => b.join("eboot.bin"),
-        _ if src.kind == Kind::Pkg => dir(&src.title_id).join("eboot.bin"),
-        _ => src.path.join("eboot.bin"),
+        Some(b) if b.join("eboot.bin").is_file() => Some(b.join("eboot.bin")),
+        _ => match src.kind {
+            Kind::Pkg => Some(dir(&src.title_id).join("eboot.bin")),
+            Kind::Folder(_) => Some(src.path.join("eboot.bin")),
+            Kind::Installed => Some(system_app.join(&src.title_id).join("eboot.bin")).filter(|p| p.is_file()),
+        },
     }
 }
+
+/// Title ids whose missing installed eboot.bin was logged in this run.
+static NO_EBOOT_LOGGED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
 
 /// What the emulator choice depends on, stat only (no eboot read): null without add_emulators.
 /// ponytail: a pkg's own dlc_emu.ini is not here; a pkg change rebuilds through the stamp.
@@ -672,14 +784,40 @@ fn emu_state(src: &Source, s: &Settings) -> serde_json::Value {
     if !s.add_emulators {
         return serde_json::Value::Null;
     }
-    let eboot = fs::metadata(eboot(src)).ok().map(|m| (m.len(), m.modified().map(secs).unwrap_or(0)));
-    serde_json::json!({
+    let eboot = eboot(src).and_then(|p| fs::metadata(p).ok()).map(|m| (m.len(), m.modified().map(secs).unwrap_or(0)));
+    // A backport's eboot.bin hides the mount state from `eboot`: look at the install's own.
+    let unmounted = src.kind == Kind::Installed && !app0(src).join("eboot.bin").is_file();
+    let mut v = serde_json::json!({
         "dlc_emu": DLC_EMU_VERSION.trim(),
         "pgo_stub": PGO_STUB_VERSION.trim(),
         "dlc_ini": dlc_ini_on_disk(src),
         "eboot": eboot,
         "playgo_off": playgo_off(src, s),
-    })
+    });
+    // The fallbacks below hold only while the backport is the same one (it may have fed them).
+    if let (Kind::Installed, Some(b)) = (&src.kind, &src.backport) {
+        v["backport"] = b.to_string_lossy().into();
+        // The system mount's part of dlc_ini alone, for the fallback below.
+        v["app0_dlc_ini"] = app0(src).join(DLC_INI).is_file().into();
+    }
+    // ponytail: an installed game's /system_ex/app/<TID> may be mounted only around a launch: while
+    // it is not, the last seen eboot and dlc_ini stay, so the fakelib is not recomposed every pass.
+    if unmounted {
+        let old = fs::read(dir(&src.title_id).join(AMPR_STATE)).ok()
+            .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+            .filter(|o| o["emus"]["backport"] == v["backport"]);
+        if let Some(o) = old.as_ref().map(|o| &o["emus"]["eboot"]).filter(|o| eboot.is_none() && !o.is_null()) {
+            v["eboot"] = o.clone();
+        }
+        // The backport's dlc_emu.ini stays live; only the system mount's part falls back (without a
+        // backport, dlc_ini is that part alone).
+        let key = if src.backport.is_some() { "app0_dlc_ini" } else { "dlc_ini" };
+        if old.as_ref().is_some_and(|o| o["emus"][key] == true) {
+            v[key] = true.into();
+            v["dlc_ini"] = true.into();
+        }
+    }
+    v
 }
 
 /// Whether the PlayGo stub is turned off for this title (the playgo_off setting).
@@ -740,7 +878,15 @@ fn contains(r: &mut impl std::io::Read, needle: &[u8], chunk: usize) -> Result<b
 /// A missing eboot: false. A read error: logged with the title id and path, None (taken as false,
 /// not memoized).
 fn wants_playgo(src: &Source) -> Option<bool> {
-    let path = eboot(src);
+    let Some(path) = eboot(src) else {
+        let mut logged = NO_EBOOT_LOGGED.lock().unwrap_or_else(|e| e.into_inner());
+        if !logged.contains(&src.title_id) {
+            logged.push(src.title_id.clone());
+            log!("{}: {}/{}/eboot.bin not readable (not mounted?), no eboot.bin in the backport: PlayGo import unknown, no pgo_stub",
+                src.title_id, SYSTEM_APP, src.title_id);
+        }
+        return None;
+    };
     let found = File::open(&path).and_then(|mut f| contains(&mut f, PLAYGO_NEEDLE, CHUNK));
     match found {
         Ok(b) => Some(b),
@@ -756,7 +902,13 @@ fn wants_playgo(src: &Source) -> Option<bool> {
 /// `had` is the previous AMPR_STATE, `state` the one being written (gets the memo).
 /// ponytail: an eboot rewritten with the same size and second keeps the old result.
 fn wants_playgo_memo(src: &Source, had: &serde_json::Value, state: &mut serde_json::Value) -> bool {
-    let Some((len, mtime)) = fs::metadata(eboot(src)).ok().map(|m| (m.len(), m.modified().map(secs).unwrap_or(0))) else {
+    let Some((len, mtime)) = eboot(src).and_then(|p| fs::metadata(p).ok()).map(|m| (m.len(), m.modified().map(secs).unwrap_or(0))) else {
+        // emu_state's fallback: an installed title's unmounted /system_ex/app/<TID> keeps the last
+        // result, so the fakelib agrees with the eboot AMPR_STATE records (same test as emu_state).
+        let same_bp = had["emus"]["backport"] == state["emus"]["backport"];
+        if let (Kind::Installed, true, Some(b)) = (&src.kind, same_bp, had["playgo"][2].as_bool()) {
+            return b;
+        }
         return wants_playgo(src).unwrap_or(false);
     };
     let old = &had["playgo"];
@@ -824,7 +976,7 @@ pub fn check(src: &Source, s: &Settings) -> Fresh {
     // Only "ampr", "emus" and "overlay_off" count: the "playgo" memo never triggers a refresh.
     let new = fakelib_state(src, s);
     if ["ampr", "emus", "overlay_off"].iter().any(|&k| had.get(k) != new.get(k)) {
-        return Fresh::Fakelib(format!("{AMPR_DIR}, inject_ampr, the bundled emulators, playgo_off or overlay_off changed"));
+        return Fresh::Fakelib(format!("{AMPR_DIR}, inject_ampr, ampr_installed, the bundled emulators, playgo_off or overlay_off changed"));
     }
     Fresh::Fresh
 }
@@ -959,6 +1111,12 @@ fn compose_fakelib(src: &Source, s: &Settings, pkg: Option<(&Io, &Pkg)>) -> Resu
         let keep = if lib.ends_with("fakelib2") { keep_fakelib } else { keep_game_lib };
         copy_flat(&lib, &fakelib, keep)?;
     }
+    if drops_game_ng(src, s) {
+        if let Some(p) = find_ci(&fakelib, AMPR_LIB) {
+            fs::remove_file(&p)?;
+            log!("{}: fakelib: dropped the backport's {} (ampr_installed off): {}", src.title_id, AMPR_LIB, p.display());
+        }
+    }
     // Our ampr-emu-ng on top of whatever the game or backport ships (its own libSceAmpr.sprx included).
     // State read before the copy: a file replaced mid-copy (ampr auto-update) then differs at the
     // next check and refreshes fakelib again, instead of being recorded as already copied.
@@ -970,7 +1128,9 @@ fn compose_fakelib(src: &Source, s: &Settings, pkg: Option<(&Io, &Pkg)>) -> Resu
         state["playgo"] = had["playgo"].clone();
     }
     if s.add_emulators {
-        let dlc = dlc_ini_on_disk(src)
+        // emus.dlc_ini is emu_state's: live, or the last recorded one while an installed title's
+        // /system_ex/app/<TID> is not mounted (the backport's stays live).
+        let dlc = state["emus"]["dlc_ini"] == true
             || pkg.is_some_and(|(_, p)| p.files().any(|e| !e.is_dir && e.path == DLC_INI));
         add_emus(&src.title_id, &fakelib, dlc, playgo_off(src, s), || wants_playgo_memo(src, &had, &mut state))?;
     }
@@ -1008,15 +1168,15 @@ pub fn build(src: &Source, s: &Settings) -> Result<()> {
     let d = dir(&src.title_id);
     log!("{}: building cache {} from {}", src.title_id, d.display(), src.path.display());
     let t0 = std::time::Instant::now();
-    let mut before = HashSet::new();
+    let mut before = None;
     let r = (|| {
         // Keep the dir: /system_ex/app/<TID> is a nullfs of this exact directory, and deleting it
         // would leave that mount on a dead inode (launch fails with 0x80940033).
         fs::create_dir_all(&d)?;
         clear_build(&d)?;
         // What is left is the game's own files: never part of the build, never removed by it.
-        before = walk(&d).into_iter().map(|e| e.0).collect();
-        build_inner(src, s, &before)
+        let b = before.insert(walk(&d).into_iter().map(|e| e.0).collect::<HashSet<_>>());
+        build_inner(src, s, b)
     })();
     if r.is_ok() {
         log!("{}: cache built in {:.1} s", src.title_id, t0.elapsed().as_secs_f64());
@@ -1024,8 +1184,11 @@ pub fn build(src: &Source, s: &Settings) -> Result<()> {
     r.map_err(|e| {
         let e = Error::new(e.kind(), format!("{} ({}): cache build: {e}", src.title_id, src.path.display()));
         log!("{e}");
-        // Without `.done` the cache is unusable: free what this build wrote.
-        remove_created(&d, &before);
+        // Without `.done` the cache is unusable: free what this build wrote. A failed clear_build
+        // has no `before`: nothing is removed then.
+        if let Some(b) = &before {
+            remove_created(&d, b);
+        }
         e
     })
 }

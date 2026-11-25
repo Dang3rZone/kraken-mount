@@ -8,6 +8,8 @@
 #[macro_use]
 mod sys;
 mod i18n;
+mod install;
+mod installed;
 mod ampr_index;
 mod cache;
 mod config;
@@ -68,7 +70,8 @@ fn check_space(state: &State, s: &Settings) {
 fn backport_of(src: &Source) -> Option<&std::path::Path> {
     match src.kind {
         Kind::Folder(_) => src.backport.as_deref(),
-        Kind::Pkg => None,
+        // A pkg's backport is copied into its cache; an installed title is never mounted by us.
+        Kind::Pkg | Kind::Installed => None,
     }
 }
 
@@ -83,7 +86,8 @@ enum Reg {
     Staged,
 }
 
-/// Builds when stale or forced, then registers.
+/// Builds when stale or forced, then registers. An installed title: build only (never registered
+/// or mounted by us), then Kraken's old /system_ex/app/<TID> stack dropped (drop_old_mount).
 fn build_and_register(state: &State, s: &Settings, src: &Source, fresh: &Fresh, forced: bool) -> std::io::Result<Reg> {
     let tid = &src.title_id;
     if let (false, Fresh::Fakelib(why)) = (forced, fresh) {
@@ -93,6 +97,20 @@ fn build_and_register(state: &State, s: &Settings, src: &Source, fresh: &Fresh, 
     }
     let stale = forced || !matches!(fresh, Fresh::Fresh | Fresh::Fakelib(_));
     let app0 = cache::app0(src);
+    if src.kind == Kind::Installed {
+        if stale {
+            remember_old_source(tid);
+            log_rebuild(tid, fresh);
+            state.update(&src.path, |g| g.status = "building");
+            check_space(state, s);
+            let r = cache::build(src, s);
+            check_space(state, s);
+            r?;
+        }
+        cache::fix_access(src);
+        drop_old_mount(s, tid);
+        return Ok(Reg::Kept);
+    }
     if !stale && register::is_registered(tid) {
         // ponytail: registered by an earlier run; only the nullfs is redone (gone after a
         // reboot; a no-op when mounted): no sce_sys copy, no install call.
@@ -104,11 +122,7 @@ fn build_and_register(state: &State, s: &Settings, src: &Source, fresh: &Fresh, 
         return Ok(Reg::Kept);
     }
     if stale {
-        match fresh {
-            Fresh::Stale(why) => log!("{tid}: cache stale ({why}); rebuilding"),
-            Fresh::Missing => log!("{tid}: no cache; building"),
-            Fresh::Fresh | Fresh::Fakelib(_) | Fresh::Moved(_) => log!("{tid}: rebuild forced"),
-        }
+        log_rebuild(tid, fresh);
         state.update(&src.path, |g| g.status = "building");
         check_space(state, s);
         let r = cache::build(src, s);
@@ -123,12 +137,20 @@ fn build_and_register(state: &State, s: &Settings, src: &Source, fresh: &Fresh, 
     Ok(if new { Reg::New } else { Reg::Staged })
 }
 
+fn log_rebuild(tid: &str, fresh: &Fresh) {
+    match fresh {
+        Fresh::Stale(why) => log!("{tid}: cache stale ({why}); rebuilding"),
+        Fresh::Missing => log!("{tid}: no cache; building"),
+        Fresh::Fresh | Fresh::Fakelib(_) | Fresh::Moved(_) => log!("{tid}: rebuild forced"),
+    }
+}
+
 /// Fresh::Moved: a folder game's /system_ex/app/<TID> stack (nullfs + backport unionfs) is redone
 /// on the new folder first, so a failed relink is retried next scan; then the cache is relinked
 /// (a pkg's app0 is its cache dir: no remount; launch.rs mounts the pkg's folder from the stamp).
 /// Only reached from the scan loop, which never runs while a game does.
 fn relink_moved(s: &Settings, src: &Source, from: &std::path::Path) -> std::io::Result<()> {
-    if src.kind != Kind::Pkg {
+    if matches!(src.kind, Kind::Folder(_)) {
         register::remount(&src.title_id, &cache::app0(src), backport_of(src))?;
     }
     cache::relink(src, s, from)?;
@@ -147,6 +169,10 @@ fn process(
 ) {
     let tid = &src.title_id;
     let forced = state.forced.lock().unwrap().remove(tid);
+    if src.kind != Kind::Installed {
+        // Kraken may mount it now: a later install of it gets its stack checked again.
+        NO_OLD_MOUNT.lock().unwrap().retain(|t| t != tid);
+    }
     let mut fresh = cache::check(src, s);
     if let (false, Fresh::Moved(from)) = (forced, &fresh) {
         fresh = match relink_moved(s, src, from) {
@@ -155,8 +181,13 @@ fn process(
             Err(e) => Fresh::Stale(format!("relink failed: {e}")),
         };
     }
-    let r = if !forced && failed.get(&src.path) == Some(&inputs_key(src, s)) {
+    let r = if !forced && failed.get(&src.path).is_some_and(|k| *k == inputs_key(src, s)) {
         state.update(&src.path, |g| g.status = "error");
+        return;
+    } else if !forced && matches!(fresh, Fresh::Fresh) && registered.contains(tid) && src.kind == Kind::Installed {
+        // The system mounts an installed title: only a leftover stack of ours is dropped (retried).
+        drop_old_mount(s, tid);
+        state.update(&src.path, |g| g.status = "ready");
         return;
     } else if !forced && matches!(fresh, Fresh::Fresh) && registered.contains(tid) {
         // Each scan: redo /system_ex/app/<TID> when it is gone or stale (USB replug, rest
@@ -181,6 +212,91 @@ fn process(
     }
 }
 
+/// Installed titles whose /system_ex/app/<TID> holds no stack of ours any more (checked once per run).
+static NO_OLD_MOUNT: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+/// (title id, folder or backport dir) of a cache stamp the installed rebuild replaced: drop_old_mount
+/// also takes a mount of these as ours (a folder from a since-removed scan root).
+/// ponytail: per run only; a payload restarted before the drop falls back to the root rules.
+static OLD_SOURCES: std::sync::Mutex<Vec<(String, String)>> = std::sync::Mutex::new(Vec::new());
+
+/// Before an installed title's cache is rebuilt: keeps the source and backport of a non-installed stamp.
+fn remember_old_source(tid: &str) {
+    if matches!(cache::stamp_kind(tid).as_deref(), None | Some("installed")) {
+        return;
+    }
+    let mut old = OLD_SOURCES.lock().unwrap();
+    for dir in [cache::stamp_source(tid), cache::stamp_backport(tid)].into_iter().flatten() {
+        old.push((tid.to_string(), dir));
+    }
+}
+
+/// The top mount at /system_ex/app/<TID> as (fstype, source without "<above>:"); None when
+/// nothing is mounted on that exact path.
+fn top_at(dst: &str) -> std::io::Result<Option<(String, String)>> {
+    let c = std::ffi::CString::new(dst).map_err(|_| std::io::Error::from_raw_os_error(libc::EINVAL))?;
+    let mut st: libc::statfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statfs(c.as_ptr(), &mut st) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let (on, fstype, from) = (launch::c_field(&st.f_mntonname), launch::c_field(&st.f_fstypename), launch::c_field(&st.f_mntfromname));
+    let from = from.strip_prefix("<above>:").unwrap_or(&from).to_string();
+    Ok((on == dst).then_some((fstype, from)))
+}
+
+/// Whether a mount (`fstype` of `from`) is one Kraken Mount made for `tid`: a nullfs/unionfs of its
+/// cache dir (pkg), of a path under a scan root (a folder game) or of a backport dir. Never one of
+/// an installed copy (`.../user/app/...`, the system's own) or anything else (pfs, ...), so a scan
+/// root like "/mnt/ext1" or "/" never claims the system's mount.
+/// ponytail: path rules, not a record of what register mounted; a scan root holding a "user/app"
+/// tree is not a supported layout.
+fn ours(fstype: &str, from: &str, tid: &str, roots: &[String]) -> bool {
+    if !matches!(fstype, "nullfs" | "unionfs") || from.contains("/user/app/") {
+        return false;
+    }
+    let from = std::path::Path::new(from);
+    from.starts_with(cache::dir(tid)) || from.starts_with("/data/homebrew/backports")
+        || roots.iter().any(|r| r != "/" && from.starts_with(r))
+}
+
+/// A title Kraken registered (FPKG or folder) that is now installed: its /system_ex/app/<TID>
+/// stack is dropped, top layer first, while the top layer is ours (never MNT_FORCE, never the
+/// system's own mount below). ponytail: not register::unmount_title, which would also unmount the
+/// system's layer under ours. Failure: logged with the title id and path, retried next pass.
+fn drop_old_mount(s: &Settings, tid: &str) {
+    if NO_OLD_MOUNT.lock().unwrap().iter().any(|t| t == tid) {
+        return;
+    }
+    let dst = format!("/system_ex/app/{tid}");
+    let mut roots = if s.scan_paths.is_empty() { storage::default_scan_roots() } else { s.scan_paths.clone() };
+    roots.extend(OLD_SOURCES.lock().unwrap().iter().filter(|(t, _)| t == tid).map(|(_, d)| d.clone()));
+    for _ in 0..4 {
+        match top_at(&dst) {
+            Ok(Some((fstype, from))) if ours(&fstype, &from, tid, &roots) => {
+                log!("{tid}: installed: unmounting Kraken Mount's {dst} ({fstype} of {from})");
+                if let Err(e) = sys::unmount(&dst, 0) {
+                    log!("{tid}: installed: unmount {dst} ({from}): {e}; retried next pass");
+                    return;
+                }
+            }
+            Ok(_) => {
+                NO_OLD_MOUNT.lock().unwrap().push(tid.to_string());
+                return;
+            }
+            // No /system_ex/app/<TID> (yet): nothing of ours can be mounted there.
+            Err(e) if matches!(e.raw_os_error(), Some(libc::ENOENT | libc::ENOTDIR)) => {
+                NO_OLD_MOUNT.lock().unwrap().push(tid.to_string());
+                return;
+            }
+            Err(e) => {
+                log!("{tid}: installed: statfs {dst}: {e}; retried next pass");
+                return;
+            }
+        }
+    }
+    log!("{tid}: installed: {dst} still has a mount of ours after 4 unmounts; retried next pass");
+}
+
 /// FW 12+: one sceAppInstUtilAppInstallAll for every title staged this pass, then each gets
 /// what `process` gives a title registered on its own (status, toast, or the error).
 fn install_staged(
@@ -191,6 +307,18 @@ fn install_staged(
         return;
     }
     let tids: Vec<String> = staged.iter().map(|g| g.title_id.clone()).collect();
+    // InstallAll walks every /user/app folder, also the one a base install is still writing.
+    // Deferred like a running game defers it: the staged titles are not in `registered`, so the
+    // next pass stages them again (and a staged tile stays staged). Logged once per wait.
+    static DEFERRED_LOGGED: AtomicBool = AtomicBool::new(false);
+    if let Some(busy) = install::busy_tid() {
+        if !DEFERRED_LOGGED.swap(true, Ordering::SeqCst) {
+            log!("register: InstallAll for [{}] waits for the install of {busy}; retried each pass", tids.join(", "));
+        }
+        staged.clear();
+        return;
+    }
+    DEFERRED_LOGGED.store(false, Ordering::SeqCst);
     let r = register::install_all(&tids);
     let one = tids.len() == 1;
     for src in staged.drain(..) {
@@ -242,6 +370,7 @@ fn finish(
 /// stays listed, new ones are "pending", duplicates "duplicate". A source still being copied
 /// keeps its old entry (it is not gone), a new one shows up once it is stable.
 fn publish(state: &State, r: &scan::ScanResult) {
+    *state.packages.lock().unwrap() = r.packages.clone();
     let mut games = state.games.lock().unwrap();
     let old = std::mem::take(&mut *games);
     for src in &r.games {
@@ -614,32 +743,30 @@ const SLOW_PASS_MS: u128 = 1000;
 /// ShadowMountPlus's process name (SMP main.c PAYLOAD_NAME): it registers and mounts the same titles.
 const SMP_PROCESS: &str = "shadowmountplus.elf";
 
-/// SMP wait_for_kstuff_ready, plus ShadowMount+ not running: polls every 2 s, one toast per
-/// reason when it starts waiting for it.
+/// ShadowMount+ not running: polls every 2 s, one toast when it starts waiting. kstuff is not waited
+/// for: nothing here needs it, and some kstuff builds do not answer its probe (launch.rs judges kstuff
+/// by whether a fake-signed game starts). The probe's answer is logged once.
 fn wait_ready(state: &State) {
+    match sys::kstuff_probe() {
+        (0, false) => log!("kstuff probe: answered"),
+        (rax, carry) => log!("kstuff probe: no answer (rax={rax:#x}, carry={carry})"),
+    }
     let s = state.settings.lock().unwrap().clone();
-    let mut waiting: Option<&str> = None;
+    let mut waiting = false;
     loop {
-        let why = if !sys::kstuff_loaded() {
-            Some("kstuff")
-        } else if launch::find_pid(SMP_PROCESS).is_some() {
-            Some("shadowmount")
-        } else {
-            None
-        };
+        let why = launch::find_pid(SMP_PROCESS).is_some().then_some("shadowmount");
         *state.waiting.lock().unwrap() = why;
         match why {
             None => {
-                if let Some(w) = waiting {
-                    log!("{w}: ready; continuing start-up");
+                if waiting {
+                    log!("shadowmount: ready; continuing start-up");
                 }
                 return;
             }
-            Some(w) if waiting != Some(w) => {
+            Some(w) if !waiting => {
                 log!("waiting before start-up: {w}");
-                let l = i18n::lang();
-                toast(&s, if w == "kstuff" { i18n::kstuff_waiting(l) } else { i18n::smp_running(l) });
-                waiting = Some(w);
+                toast(&s, i18n::smp_running(i18n::lang()));
+                waiting = true;
             }
             Some(_) => {}
         }
@@ -692,7 +819,8 @@ fn missing_sources(r: &scan::ScanResult, running: &HashSet<String>) -> HashMap<S
         let Ok(raw) = std::fs::read(e.path().join(cache::DONE)) else { continue };
         let Ok(stamp) = serde_json::from_slice::<serde_json::Value>(&raw) else { continue };
         let Some(source) = stamp["source"].as_str() else { continue };
-        if running.contains(&tid)
+        if !auto_removable(&stamp)
+            || running.contains(&tid)
             || r.games.iter().any(|g| g.title_id == tid)
             || r.unstable.iter().any(|(p, t)| t.as_ref() == Some(&tid) || p.as_os_str() == source)
             || !gone(source.as_ref())
@@ -703,6 +831,12 @@ fn missing_sources(r: &scan::ScanResult, running: &HashSet<String>) -> HashMap<S
         out.insert(tid, source.to_string());
     }
     out
+}
+
+/// An installed title's cache (stamp kind "installed") is never auto-removed: we did not register
+/// it, and uninstalling would remove the real install.
+fn auto_removable(stamp: &serde_json::Value) -> bool {
+    stamp["kind"] != "installed"
 }
 
 /// One auto-remove step after a full scan pass: start/reset timers, then unregister the due
@@ -776,6 +910,7 @@ fn main() {
         std::thread::spawn(klog_capture);
     }
     let state = Arc::new(State::new(s));
+    install::init(state.clone());
     let st = state.settings.lock().unwrap().clone();
     // Not gated on inject_ampr: pkg games get the ampr dir regardless.
     if st.ampr_auto_update {
@@ -784,7 +919,7 @@ fn main() {
     }
     let web_state = state.clone();
     std::thread::spawn(move || web::serve(web_state, listener));
-    // The web UI is up; nothing mounts until kstuff answers and ShadowMount+ is gone.
+    // The web UI is up; nothing mounts until ShadowMount+ is gone.
     wait_ready(&state);
     let (titles, running) = (state.titles.clone(), state.running.clone());
     // Built caches are launchable before the first scan ends: watch them from the start.
@@ -793,7 +928,16 @@ fn main() {
             titles.lock().unwrap().insert(e.file_name().to_string_lossy().into_owned());
         }
     }
-    std::thread::spawn(move || launch::watch(titles, running));
+    std::thread::spawn(move || {
+        let mut wait = 1;
+        loop {
+            let t0 = std::time::Instant::now();
+            launch::watch(titles.clone(), running.clone());
+            // A watcher that fails again at once backs off up to a minute instead of filling the log.
+            wait = if t0.elapsed().as_secs() < 5 { (wait * 2).min(60) } else { 2 };
+            std::thread::sleep(std::time::Duration::from_secs(wait));
+        }
+    });
     let (mut registered, mut failed) = (HashSet::new(), HashMap::new());
     // Auto-remove timers start only after the first full pass: a drive not mounted yet at start
     // looks like a missing source until then (the delay covers the rest).
@@ -827,7 +971,7 @@ fn main() {
         sys::LOG_FILE.store(s.log, Ordering::Relaxed);
         state.busy.store(true, Ordering::SeqCst);
         let roots = if s.scan_paths.is_empty() { storage::default_scan_roots() } else { s.scan_paths.clone() };
-        let r = scan::scan(&roots, &s.exclude, s.backports, s.stability_wait_secs);
+        let r = scan::scan(&roots, &s.exclude, s.backports, s.stability_wait_secs, install::busy_tid().as_deref());
         let scan_ms = pass.elapsed().as_millis();
         if state.paused() {
             continue;

@@ -48,7 +48,7 @@ fn patch_param_json(buf: &mut Vec<u8>) -> bool {
 fn copy_file(title_id: &str, src: &Path, dst: &Path) -> io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
     if src.file_name().is_some_and(|n| n == "param.json") {
-        let mut buf = fs::read(src)?;
+        let mut buf = crate::scan::read_capped(src, 1 << 20)?;
         let patched = patch_param_json(&mut buf);
         fs::write(dst, &buf)?;
         if patched {
@@ -316,7 +316,10 @@ fn resolve_symbol(nid: &[u8], name: &[u8], label: &str) -> Result<*mut c_void, S
     APP_INST_INIT.get_or_init(|| {
         let rc = unsafe { sceUserServiceInitialize(ptr::null()) };
         log!("sceUserServiceInitialize: {:#x}", rc as u32);
-        let rc = unsafe { sceAppInstUtilInitialize() };
+        let rc = {
+            let _appinst = crate::install::AppInst::lock();
+            unsafe { sceAppInstUtilInitialize() }
+        };
         log!("sceAppInstUtilInitialize: {:#x}", rc as u32);
     });
     let lib = CString::new(APP_INST_UTIL).expect("no NUL");
@@ -372,7 +375,10 @@ fn resolve_uninstall() -> Result<UninstallTitle, String> {
 pub fn uninstall(tid: &str) -> io::Result<()> {
     let f = UNINSTALL_FN.get_or_init(resolve_uninstall).as_ref().map_err(|e| err(e.clone()))?;
     let title_id = CString::new(tid).map_err(|_| err(format!("NUL in {tid}")))?;
-    let rc = unsafe { f(title_id.as_ptr()) } as u32;
+    let rc = {
+        let _appinst = crate::install::AppInst::lock();
+        (unsafe { f(title_id.as_ptr()) }) as u32
+    };
     if rc == 0 { Ok(()) } else { Err(err(format!("sceAppInstUtilAppUnInstall({tid}): {rc:#x}"))) }
 }
 
@@ -392,7 +398,10 @@ fn install_title_dir(title_id: &str) -> io::Result<()> {
     let f = *INSTALL_FN.get_or_init(resolve_install).as_ref().map_err(|e| err(e.clone()))?;
     let tid = CString::new(title_id).map_err(|_| err(format!("NUL in {title_id}")))?;
     let base = CString::new(format!("{APP_BASE}/")).expect("no NUL");
-    let rc = unsafe { f(tid.as_ptr(), base.as_ptr(), ptr::null_mut()) } as u32;
+    let rc = {
+        let _appinst = crate::install::AppInst::lock();
+        (unsafe { f(tid.as_ptr(), base.as_ptr(), ptr::null_mut()) }) as u32
+    };
     if rc == 0 || rc == ALREADY_INSTALLED {
         return Ok(());
     }
@@ -413,7 +422,10 @@ pub fn install_all(title_ids: &[String]) -> io::Result<()> {
     // next start, so a failing call does not repeat (~20 s) every pass.
     let tile = TILE_STAGED.lock().unwrap().take();
     let t = std::time::Instant::now();
-    let rc = unsafe { sceAppInstUtilAppInstallAll(ptr::null_mut()) } as u32;
+    let rc = {
+        let _appinst = crate::install::AppInst::lock();
+        (unsafe { sceAppInstUtilAppInstallAll(ptr::null_mut()) }) as u32
+    };
     let ms = t.elapsed().as_millis();
     let ids: Vec<&str> = title_ids.iter().map(String::as_str).chain(tile.as_ref().map(|_| TILE_ID)).collect();
     log!("{}: {why}; sceAppInstUtilAppInstallAll: {rc:#x} ({ms} ms)", ids.join(", "));
@@ -485,13 +497,8 @@ pub fn is_ours(title_id: &str) -> Result<(), PathBuf> {
 /// `is_ours` under `root` (a fake tree in tests).
 fn is_ours_in(root: &Path, title_id: &str) -> Result<(), PathBuf> {
     let app = root.join("user/app").join(title_id);
-    for p in [app.join("app.pkg"), root.join("mnt/ext0/user/app").join(title_id),
-        root.join("mnt/ext1/user/app").join(title_id)]
-    {
-        // Only ENOENT/ENOTDIR is "absent": a stat error (a drive that answers badly) protects.
-        if !matches!(fs::symlink_metadata(&p), Err(e) if matches!(e.raw_os_error(), Some(libc::ENOENT | libc::ENOTDIR))) {
-            return Err(p);
-        }
+    if let Some(p) = crate::installed::copy_in(root, title_id) {
+        return Err(p);
     }
     if !app.join("sce_sys/param.json").is_file() {
         return Err(app);
@@ -597,6 +604,22 @@ pub fn mount(title_id: &str, app0: &Path, backport: Option<&Path>) -> io::Result
 /// MNT_FORCE: a running game's stack fails with EBUSY.
 pub fn remount(title_id: &str, app0: &Path, backport: Option<&Path>) -> io::Result<()> {
     ctx(mount_inner(title_id, app0, backport, false), || format!("remount {title_id} ({})", app0.display()))
+}
+
+/// The stack at /system_ex/app/<TID> without its backport unionfs, before the backport is deleted:
+/// redone on `app0` alone when something is mounted there. Never MNT_FORCE: busy = EBUSY.
+pub fn drop_backport(title_id: &str, app0: &Path) -> io::Result<()> {
+    match mount_source(&format!("{SYSTEM_EX_APP}/{title_id}")) {
+        Ok(None) => Ok(()),
+        // Never registered (no mount point yet): no stack to redo. A stale stack (its drive gone)
+        // answers ENOENT too, but its name is still listed in /system_ex/app.
+        Err(e) if matches!(e.raw_os_error(), Some(libc::ENOENT | libc::ENOTDIR))
+            && fs::read_dir(SYSTEM_EX_APP)
+                .and_then(|d| d.map(|x| x.map(|x| x.file_name())).collect::<io::Result<Vec<_>>>())
+                .is_ok_and(|names| !names.iter().any(|n| n == title_id)) => Ok(()),
+        Err(e) => Err(e),
+        Ok(Some(_)) => remount(title_id, app0, None),
+    }
 }
 
 /// `keep_active`: keep a live overlay of the same backport (fresh cache). A full register

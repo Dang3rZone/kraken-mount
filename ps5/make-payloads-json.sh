@@ -57,7 +57,7 @@ printf '%s\n' \
   "      \"url\": \"https://github.com/$repo/releases/download/v$version/$asset\"," \
   "      \"version\": \"v$version\"," \
   "      \"last_update\": \"$date\"," \
-  '      "description": "Plays PS5 games from the internal SSD and USB drives (debug FPKG .pkg files and game folders) without installing them. The web UI opens on port 8097.",' \
+  '      "description": "Plays PS5 games from the internal SSD and USB drives (debug FPKG .pkg files and game folders) without installing them, or installs FPKGs through the console installer. The web UI opens on port 8097.",' \
   '      "category": "Utilities & Tools",' \
   "      \"checksum\": \"$sha\"," \
   '      "author": "quer3q",' \
