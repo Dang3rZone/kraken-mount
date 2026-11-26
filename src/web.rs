@@ -254,7 +254,7 @@ pub fn serve(state: Arc<State>, mut listener: TcpListener) {
             Ok((conn, _)) => {
                 let state = state.clone();
                 std::thread::spawn(move || {
-                    let _ = handle(&state, conn);
+                    let _ = handle(&state, conn, false);
                 });
             }
             Err(e) => {
@@ -267,6 +267,51 @@ pub fn serve(state: Arc<State>, mut listener: TcpListener) {
                 log!("web UI on port {PORT} again");
             }
         }
+    }
+}
+
+/// ShadowMount+'s default API port: clients that only know ShadowMount+ (Playden, RecompStore)
+/// reach /api/v1 here (#126). Loopback only, as SMP's default bind.
+pub const SMP_PORT: u16 = 10101;
+
+/// Whether a request on SMP_PORT is served: only /api/v1 (the UI, /pkg and the native API stay on PORT).
+fn smp_request(head: &str) -> bool {
+    head.split_whitespace().nth(1).is_some_and(|t| t.starts_with("/api/v1/"))
+}
+
+/// Serves /api/v1 on 127.0.0.1:SMP_PORT forever. The port is busy while ShadowMount+ still runs:
+/// binds every 2 s until it is free, and again after an accept error (rest mode, as serve).
+pub fn serve_smp(state: Arc<State>) {
+    let mut logged = false;
+    loop {
+        let listener = match TcpListener::bind(("127.0.0.1", SMP_PORT)) {
+            Ok(l) => l,
+            Err(e) => {
+                if !logged {
+                    logged = true;
+                    log!("web: ShadowMount+ API port {SMP_PORT} busy ({e}); retrying every 2 s");
+                }
+                std::thread::sleep(Duration::from_secs(2));
+                continue;
+            }
+        };
+        logged = false;
+        log!("ShadowMount+ API on 127.0.0.1:{SMP_PORT}");
+        loop {
+            match listener.accept() {
+                Ok((conn, _)) => {
+                    let state = state.clone();
+                    std::thread::spawn(move || {
+                        let _ = handle(&state, conn, true);
+                    });
+                }
+                Err(e) => {
+                    log!("web: accept on port {SMP_PORT} failed: {e}; binding it again");
+                    break;
+                }
+            }
+        }
+        std::thread::sleep(Duration::from_secs(1));
     }
 }
 
@@ -399,11 +444,13 @@ fn change_settings(state: &State, what: &str, f: impl FnOnce(&mut Settings) -> b
     Ok(true)
 }
 
-fn handle(state: &State, mut conn: TcpStream) -> std::io::Result<()> {
+/// One request; `smp`: it came in on SMP_PORT, which answers only /api/v1.
+fn handle(state: &State, mut conn: TcpStream, smp: bool) -> std::io::Result<()> {
     conn.set_read_timeout(Some(Duration::from_secs(5)))?;
     conn.set_write_timeout(Some(Duration::from_secs(10)))?;
     let loopback = conn.peer_addr().map(|a| a.ip().is_loopback()).unwrap_or(false);
     let r = match read_request(&mut conn)? {
+        Ok((head, _)) if smp && !smp_request(&head) => fail(404, libc::ENOENT, "unknown route").json(),
         // The installer fetching the package of the running install (install.rs).
         Ok((head, _)) if loopback && is_pkg_request(&head) => {
             crate::install::serve_conn(conn, &head);

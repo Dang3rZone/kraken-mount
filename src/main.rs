@@ -954,6 +954,8 @@ fn main() {
     }
     let web_state = state.clone();
     std::thread::spawn(move || web::serve(web_state, listener));
+    let smp_state = state.clone();
+    std::thread::spawn(move || web::serve_smp(smp_state));
     // The web UI is up; nothing mounts until ShadowMount+ is gone.
     wait_ready(&state);
     let (titles, running) = (state.titles.clone(), state.running.clone());
