@@ -271,7 +271,8 @@ pub fn serve(state: Arc<State>, mut listener: TcpListener) {
 }
 
 /// ShadowMount+'s default API port: clients that only know ShadowMount+ (Playden, RecompStore)
-/// reach /api/v1 here (#126). Loopback only, as SMP's default bind.
+/// on the console reach /api/v1 here (#126). Loopback only on purpose (SMP binds 0.0.0.0): ps5upload
+/// on a PC probes this port and would see both mounters running.
 pub const SMP_PORT: u16 = 10101;
 
 /// Whether a request on SMP_PORT is served: only /api/v1 (the UI, /pkg and the native API stay on PORT).

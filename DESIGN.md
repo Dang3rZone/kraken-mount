@@ -831,8 +831,9 @@ answers, and two copies would scan at once. The install fails and its marker mea
   `State::work` (each delete wakes the scan loop); 204 when all succeed, 404 when none has one, else the highest
   failure code with one `<TID>: <reason>` line per failed title (the others are deleted).
 - `POST /api/v1/<route>`: the subset of ShadowMount+'s API v1 (SMP `docs/api.md`) that Playden calls, on port 8097
-  and on 127.0.0.1:10101, ShadowMount+'s default API address, so clients that only know ShadowMount+ (Playden,
-  RecompStore) reach it (#126). Port 10101 answers only `/api/v1/` (anything else: the unknown-route 404 below);
+  and on 127.0.0.1:10101 (ShadowMount+'s default API port), so clients on the console that only know ShadowMount+
+  (Playden, RecompStore) reach it (#126). Loopback only on purpose (ShadowMount+ binds 0.0.0.0): ps5upload on a PC
+  probes 10101 and would see both mounters running. Port 10101 answers only `/api/v1/` (anything else: the unknown-route 404 below);
   while ShadowMount+ still holds it, Kraken Mount binds it again every 2 s, and again after an accept error.
   Body: one JSON object (empty or whitespace = `{}`; anything else 400). Answer: JSON, HTTP 200 with `status: 0`,
   else `{status: <FreeBSD errno>, error}` with HTTP 400 (EINVAL), 404 (ENOENT; also an unknown route), 409
