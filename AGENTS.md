@@ -68,7 +68,8 @@ sandbox. Web UI on port 8097 (opened from the "Kraken Mount" home-screen tile).
   rename them.
 - `DESIGN.md` is the contract. Change it together with the code, and keep module interface names.
 - Mount safety: never `MNT_FORCE` from register/purge; a busy mount means a running game. The scan loop
-  must not build, register or purge while a game runs (`running` set from the launch watcher).
+  must not build, register or purge while a game runs (`running` set from the launch watcher). A running
+  homebrew (`scan::homebrew`) does not pause it, but its own title is never touched and purge still waits.
 - `/app0` is writable. Game-written files in a cache survive Rebuild (`.built`); only Purge deletes them.
 - Old-layout caches (`/data/krakenmount/<TID>`) are deleted by hand: no cleanup code for them.
 - Pkg-specific behaviour in ng goes behind `pkg_mode()`; zstd/LZ4 behaviour stays unchanged. Pkg perf

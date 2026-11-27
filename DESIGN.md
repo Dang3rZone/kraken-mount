@@ -307,6 +307,12 @@ Self-update (`src/update.rs`): always on, no setting, once per start, on its own
 Running game: while `launch::watch` reports a live session (`running`), the loop does no
 scan/build/register/purge (a game starting mid-scan stops the scan before the next title);
 rescan/rebuild/purge requests stay queued and run after the game exits (2 s poll).
+A running homebrew (`scan::homebrew`: a valid title id not `CUSA*`/`PPSA*`, as SMP 1.7beta6) does not pause the loop
+(`State::game_running` = `running` minus homebrew; `State::paused` stays any session): a launcher like Playden gets its
+new games on the home screen while it runs. Its own title is skipped by `process` (no check, build, register or
+remount; a forced rebuild waits), purge waits for `paused` (it would empty the mounted cache), and everything else
+gated on `paused` (self-update, `/api/quit`, the install queue, web delete/hide/uninstall/eject, `/api/state` `paused`)
+still waits. ponytail: the UI banner says paused while such a pass runs.
 Toasts: `sceNotificationSend` system toast (dump-forge/SMP JSON, icon `/user/data/krakenmount/notify-icon.png`),
 the old `sceKernelSendNotificationRequest` only as fallback. Toast texts (`src/i18n.rs`) follow the console language
 (`sceSystemServiceParamGetInt` lang, read per toast; dump-forge's 11: en ru zh de es fr ja pt it ko ar), English when it
@@ -604,6 +610,7 @@ pub fn still_written(paths: &[std::path::PathBuf], wait: u64) -> Option<u64>; //
 pub fn read_source(path: &std::path::Path) -> Option<Source>; // one path read as the scan does (pkg memo), backport None; None = not a readable game or a patch/DLC .pkg (the hidden list)
 pub fn parse_param(json: &[u8]) -> std::io::Result<(String, String, String)>; // (title_id, title_name, version); name: see below
 pub fn valid_tid(t: &str) -> bool;
+pub fn homebrew(t: &str) -> bool;                          // valid_tid and not CUSA/PPSA: running, it does not pause the scan loop
 
 // cache.rs
 pub const CACHES: &str = "/data/krakenmount/caches";

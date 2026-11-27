@@ -187,6 +187,11 @@ fn process(
     staged: &mut Vec<Source>,
 ) {
     let tid = &src.title_id;
+    // A homebrew running while the pass goes on (State::game_running): its cache, app0 and mount
+    // stay as they are; a queued rebuild waits for its exit.
+    if state.running.lock().unwrap().contains(tid) {
+        return;
+    }
     let forced = state.forced.lock().unwrap().remove(tid);
     if src.kind != Kind::Installed {
         // Kraken may mount it now: a later install of it gets its stack checked again.
@@ -882,7 +887,7 @@ fn auto_remove(state: &State, s: &Settings, r: &scan::ScanResult, timers: &mut M
     let keys: HashSet<String> = missing.keys().cloned().collect();
     for tid in timers.due(&keys, now, s.auto_remove_delay_secs) {
         // A game may have started since `running` was read: stop, the next full pass retries.
-        if state.paused() {
+        if state.game_running() {
             return;
         }
         let source = &missing[&tid];
@@ -988,9 +993,10 @@ fn main() {
     let (mut timers, mut full_pass, t0) = (MissingTimers::default(), false, std::time::Instant::now());
     loop {
         // A game runs: nothing that could touch its app0 or /system_ex mount. Rescan, rebuild
-        // and purge requests stay queued (forced / purge) for after it exits.
+        // and purge requests stay queued (forced / purge) for after it exits. A running homebrew
+        // does not pause the loop (game_running); process() skips its title, purge waits.
         // ponytail: polls every 2 s instead of a wake from the watcher.
-        if state.paused() {
+        if state.game_running() {
             state.busy.store(false, Ordering::SeqCst);
             std::thread::sleep(Duration::from_secs(2));
             continue;
@@ -1017,7 +1023,7 @@ fn main() {
         let roots = if s.scan_paths.is_empty() { storage::default_scan_roots() } else { s.scan_paths.clone() };
         let r = scan::scan(&roots, &s.exclude, s.backports, s.stability_wait_secs, install::busy_tid().as_deref(), &|t| s.ng_installed(t));
         let scan_ms = pass.elapsed().as_millis();
-        if state.paused() {
+        if state.game_running() {
             continue;
         }
         // Purge after the scan, so `keep` is this scan's library and every kept title rebuilds below.
@@ -1028,7 +1034,8 @@ fn main() {
             if !PURGE_WAIT_LOGGED.swap(true, Ordering::SeqCst) {
                 log!("purge waits: {} source(s) still being copied", r.unstable.len());
             }
-        } else if state.purge.swap(false, Ordering::SeqCst) {
+        } else if !state.paused() && state.purge.swap(false, Ordering::SeqCst) {
+            // paused, not game_running: purge() would empty a running homebrew's mounted cache too.
             PURGE_WAIT_LOGGED.store(false, Ordering::SeqCst);
             let keep: Vec<String> = r.games.iter().map(|g| g.title_id.clone()).collect();
             match cache::purge(&keep) {
@@ -1049,7 +1056,7 @@ fn main() {
         check_space(&state, &s);
         let (mut full, mut staged) = (true, Vec::new());
         for src in &r.games {
-            if state.paused() {
+            if state.game_running() {
                 log!("a game started; scan paused until it exits");
                 full = false;
                 break;
@@ -1065,11 +1072,11 @@ fn main() {
         // not in `registered`, so the pass after the game exits stages them again and installs them.
         // ponytail: a title already on the home screen (a rebuild) is only remounted then; its
         // app.db row keeps the old version and name until its next full register.
-        if !state.paused() {
+        if !state.game_running() {
             install_staged(&state, &s, &mut staged, &mut registered, &mut failed);
             register::sync_snd0info_if_changed(&registered);
         }
-        if full_pass && full && !state.paused() {
+        if full_pass && full && !state.game_running() {
             auto_remove(&state, &s, &r, &mut timers, t0.elapsed().as_secs());
         }
         full_pass |= full;

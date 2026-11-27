@@ -98,6 +98,12 @@ impl State {
         !self.running.lock().unwrap().is_empty()
     }
 
+    /// paused, minus a running homebrew (a launcher like Playden waits for its new games on the home
+    /// screen): the scan loop goes on and only leaves that title alone (main.rs `process`).
+    pub fn game_running(&self) -> bool {
+        self.running.lock().unwrap().iter().any(|t| !crate::scan::homebrew(t))
+    }
+
     /// Title ids of the library (duplicates excluded).
     pub fn library(&self) -> Vec<String> {
         let games = self.games.lock().unwrap();

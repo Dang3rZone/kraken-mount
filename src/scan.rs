@@ -738,3 +738,8 @@ pub fn valid_tid(t: &str) -> bool {
     b.len() == 9 && b[..4].iter().all(u8::is_ascii_uppercase) && b[4..].iter().all(u8::is_ascii_digit)
         && !t.starts_with("NPXS")
 }
+
+/// A homebrew title id (SMP 1.7beta6): a valid one that is not a PS4 (CUSA) or PS5 (PPSA) game.
+pub fn homebrew(t: &str) -> bool {
+    valid_tid(t) && !t.starts_with("CUSA") && !t.starts_with("PPSA")
+}
